@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AnyDoc</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ══ 顶栏 ══ -->
+<header>
+  <div class="brand">
+    <span class="mark">A</span>
+    <div>
+      <b>AnyDoc</b>
+      <small>文档转 Markdown</small>
+    </div>
+  </div>
+  <div class="right">
+    <span id="kernel" class="kernel">内核加载中</span>
+    <button id="btnOut" class="btn ghost sm" title="选择输出目录">
+      <span id="outLabel">输出到</span>
+    </button>
+  </div>
+</header>
+
+<!-- ══ 主体 ══ -->
+<main>
+
+  <!-- 投放区 -->
+  <div id="drop" class="drop">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 15V3m0 0L8 7m4-4 4 4"/>
+      <path d="M4 14v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>
+    </svg>
+    <div class="txt">
+      <div class="hint">拖入文档，或 <button id="btnFiles" class="lnk">选择文件</button> / <button id="btnDir" class="lnk">选择文件夹</button></div>
+      <small>Word · PowerPoint · Excel · PDF · EPUB · ODT · RTF · CSV</small>
+    </div>
+  </div>
+
+  <!-- 任务列表 -->
+  <div id="list" class="list" hidden>
+    <div class="list-head">
+      <span id="count">0 个文件</span>
+      <div class="head-actions">
+        <button id="btnAll" class="btn ghost sm">全选目录</button>
+        <button id="btnClear" class="btn ghost sm">清空</button>
+      </div>
+    </div>
+    <div id="rows" class="rows"></div>
+  </div>
+
+  <!-- 空状态 -->
+  <div id="empty" class="empty">
+    <p>还没有待转换的文件</p>
+  </div>
+
+</main>
+
+<!-- ══ 底部进度条 ══ -->
+<footer id="foot" class="foot">
+  <div class="bar"><i id="fill"></i></div>
+  <div class="foot-row">
+    <span id="stat" class="stat">就绪</span>
+    <span id="pct" class="pct">0%</span>
+  </div>
+</footer>
+
+<input type="file" id="fPicker" multiple hidden
+  accept=".doc,.docx,.docm,.ppt,.pptx,.pptm,.xls,.xlsx,.xlsm,.odt,.ods,.odp,.rtf,.epub,.csv,.pdf">
+<input type="file" id="dPicker" webkitdirectory hidden>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

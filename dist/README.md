@@ -1,6 +1,6 @@
-# AnyDoc v0.2.0 — 文档秒变 Markdown
+# AnyDoc — 文档秒变 Markdown
 
-**解析内核：[firecrawl/anydoc](https://github.com/firecrawl/anydoc) v0.2.4（MIT License）**
+**解析内核：[firecrawl/anydoc](https://github.com/firecrawl/anydoc) v0.2.4（MIT）**
 
 ---
 
@@ -8,35 +8,43 @@
 
 ```
 anydoc-gui/
-├── anydoc-gui.exe      ← GUI 启动器（双击这个）
+├── anydoc-gui.exe      ← 图形版启动器（双击这个）
 ├── anydoc.exe          ← 命令行版（可选）
-└── gui/                ← GUI 资源（请勿删除）
+└── gui/                ← 图形界面资源（请勿删除）
     ├── index.html
     ├── app.css
     ├── app.js
+    ├── worker.js
     ├── anydoc_wasm.js
     └── anydoc_wasm_bg.wasm   ← 官方 anydoc 内核（WebAssembly）
 ```
 
 ---
 
-## GUI 用法（推荐给不熟命令行的朋友）
+## 图形版用法
 
-1. 解压整个文件夹
-2. **双击 `anydoc-gui.exe`**
-3. 浏览器自动打开界面（默认 Edge/Chrome）
-4. 把文档拖进网页 → 点「开始转换」→ 点「另存为」选目录
+1. 解压**整个文件夹**
+2. 双击 `anydoc-gui.exe`
+3. 浏览器自动打开界面
+4. 拖入文档 → 点「开始转换」
 
-> ⚠️ 请务必**完整解压**再运行，不要只单独拷 exe。
-> ⚠️ `gui/` 目录是内核文件，删了就用不了。
+### 批量转换
 
-### 转换在哪里发生？
+- **拖入多个文件** —— 一次拖一批
+- **选择文件夹** —— 自动读取该目录下所有文档，子目录结构会保留
+- 转换完成后自动写入你指定的输出目录（每篇一个 `.md`）
 
-**全部在你的电脑本地完成。** 内核是 WebAssembly，文件不上传、不联网、不经过任何服务器。
+### 进度显示
+
+- **每个任务独立状态**：等待 → 转换中（带转圈动画）→ ✓ 成功（显示耗时）/ ✗ 失败（显示原因）
+- **底部总进度条**：实时百分比 + 汇总（成功数 / 失败数 / 总耗时）
+- 转换在 **Web Worker 池**里并行执行，界面不卡
+
+> 转换全部在你的电脑本地完成，**文件不上传任何服务器**。
 
 ---
 
-## 命令行用法（给开发者）
+## 命令行用法
 
 ```cmd
 :: 单文件
@@ -45,7 +53,7 @@ anydoc.exe report.docx
 :: 整个目录（递归）
 anydoc.exe .\docs\ -r
 
-:: 指定输出目录 + 详细输出
+:: 指定输出目录 + 详细日志
 anydoc.exe .\docs\ -o .\markdown\ -r -v
 
 :: 查看帮助
@@ -66,9 +74,9 @@ anydoc.exe --help
 
 ### 格式识别看内容，不只看后缀
 
-anydoc 读**文件字节签名**判断真实格式（PDF 头、RTF 起始标记、OLE 流名、ZIP 内部 mimetype）。
+anydoc 读**文件字节签名**判断真实格式（PDF header、RTF 起始标记、OLE 流名、ZIP 内部 mimetype）。
 
-所以：把 `报告.docx` 改名成 `报告.pdf`，**它照样能正确解析**。这在处理用户上传的乱标文件时很关键。
+所以：把 `报告.docx` 改名成 `报告.pdf`，**它照样能正确解析**。
 
 ---
 
@@ -79,10 +87,10 @@ anydoc 读**文件字节签名**判断真实格式（PDF 头、RTF 起始标记�
 | 扫描件 / 图片版 PDF | ❌ **不支持**，需要 OCR（anydoc 本身不含 OCR） |
 | 加密 / 有密码的文档 | ❌ 报错 `encrypted` |
 | 结构损坏的文件 | ❌ 报错 `malformed`，不会给你半成品 |
-| 超出安全限制（解压炸弹等） | ❌ 报错 `resourceLimit` |
+| 超出安全限制 | ❌ 报错 `resourceLimit` |
 | Excel 公式 | 读取计算结果，不保留公式本身 |
 
-界面报错时会给出**具体原因**，不是笼统的「转换失败」。
+界面报错时会显示**具体原因**（如"需 OCR""文件已加密"），不是笼统的「转换失败」。
 
 ---
 
