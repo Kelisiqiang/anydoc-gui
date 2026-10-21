@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AnyDoc - 文档秒变 Markdown</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <span class="mark">A</span>
+      <div>
+        <h1>AnyDoc</h1>
+        <p>Word / PPT / Excel / PDF → Markdown</p>
+      </div>
+    </div>
+    <div class="badge" id="badge">加载内核…</div>
+  </header>
+
+  <main>
+    <!-- 拖放区 -->
+    <div id="drop" class="drop">
+      <div class="drop-in">
+        <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5"/>
+          <path d="M3.5 15v3.5A1.5 1.5 0 005 20h14a1.5 1.5 0 001.5-1.5V15"/>
+        </svg>
+        <b>把文档拖到这里</b>
+        <span>或 <button id="pick" class="link">选择文件</button></span>
+      </div>
+    </div>
+
+    <!-- 队列 -->
+    <div id="queue" class="queue"></div>
+
+    <!-- 设置 -->
+    <div class="opts">
+      <label class="opt">
+        <input type="checkbox" id="mkdir"> 为每个文件建独立目录
+      </label>
+      <label class="opt">
+        <input type="checkbox" id="copy"> 转换后复制 Markdown
+      </label>
+      <div class="spacer"></div>
+      <button id="clear" class="btn ghost">清空</button>
+      <button id="save" class="btn ghost">另存为…</button>
+      <button id="run" class="btn primary" disabled>开始转换</button>
+    </div>
+
+    <!-- 日志 -->
+    <div id="log" class="log"></div>
+  </main>
+
+  <footer>
+    <span>解析内核 <b>firecrawl/anydoc</b> v0.2.4 · MIT</span>
+    <span class="rt" id="rt"></span>
+  </footer>
+</div>
+
+<input type="file" id="file" multiple hidden
+  accept=".doc,.docx,.docm,.ppt,.pptx,.pptm,.xls,.xlsx,.xlsm,.odt,.ods,.odp,.rtf,.epub,.csv,.pdf">
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
