@@ -12,6 +12,7 @@ use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
+#[derive(Clone)]
 pub struct IconEntry {
     pub hicon: Option<HICON>,
 }

@@ -74,6 +74,24 @@ pub fn dpi_for_window(hwnd: HWND) -> u32 {
     }
 }
 
+/// 初始化缩放系数（创建窗口前调用）
+///
+/// 用 GetDeviceCaps 拿系统 DPI，避免依赖窗口句柄。
+pub fn init_scale() -> i32 {
+    unsafe {
+        let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+        let dpi = windows::Win32::Graphics::Gdi::GetDeviceCaps(
+            hdc,
+            windows::Win32::Graphics::Gdi::LOGPIXELSX,
+        );
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+        let dpi = if dpi > 0 { dpi } else { 96 };
+        let scale = ((dpi as f64 / 96.0) * 100.0).round() as i32;
+        SCALE.store(scale, Ordering::Relaxed);
+        scale
+    }
+}
+
 /// 更新全局缩放系数，返回新值
 pub fn update_scale(hwnd: HWND) -> i32 {
     let dpi = dpi_for_window(hwnd);

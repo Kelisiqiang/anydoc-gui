@@ -11,6 +11,7 @@ use crate::dpi;
 use crate::state::Status;
 
 /// 主题配色
+#[derive(Clone)]
 pub struct Theme {
     pub bg: COLORREF,
     pub card: COLORREF,

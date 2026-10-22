@@ -53,6 +53,8 @@ fn main() {
 
     // DPI 感知必须在创建窗口前
     dpi::enable_dpi_awareness();
+    // 初始化缩放系数（窗口尺寸要用它算）
+    let _ = dpi::init_scale();
 
     unsafe {
         // 单实例检查
