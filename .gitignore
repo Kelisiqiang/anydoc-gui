@@ -5,4 +5,4 @@ dist/*.exe
 *.pfx
 *.key
 .DS_Store
-Thumbs.db
+Thumbs.db.credential-test
