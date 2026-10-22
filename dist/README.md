@@ -68,7 +68,7 @@ anydoc.exe --help
 |------|--------|
 | Word | `.doc` `.docx` `.docm` |
 | PowerPoint | `.ppt` `.pptx` `.pptm` |
-| Excel | `.xls` `.xlsx` `.xlsm` |
+| Excel | `.xls` `.xlsx` `.xlsm` `.xlsb` |
 | OpenDocument | `.odt` `.ods` `.odp` |
 | 其他 | `.rtf` `.epub` `.csv` `.pdf` |
 

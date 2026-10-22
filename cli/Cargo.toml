@@ -1,5 +1,5 @@
 [package]
-name = "anydoc"
+name = "anydoc-win"
 version = "0.2.0"
 description = "AnyDoc GUI - Document to Markdown converter powered by firecrawl/anydoc"
 authors = ["AnyDoc Team"]
@@ -12,7 +12,7 @@ name = "anydoc"
 path = "src/main.rs"
 
 [lib]
-name = "anydoc_core"
+name = "anydoc_win_core"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 

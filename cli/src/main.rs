@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use anydoc_core::{convert_directory, convert_file, is_supported_extension};
+use anydoc_win_core::{convert_directory, convert_file, is_supported_extension};
 
 #[derive(Parser, Debug)]
 #[command(name = "anydoc")]
