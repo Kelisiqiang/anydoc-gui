@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<link rel="stylesheet" href="mock.css"></head>
+<body>
+
+<!-- ════════ 状态 1：空 ════════ -->
+<div class="win" id="s1">
+  <div class="titlebar">
+    <div class="tb-icon">A</div><div class="tb-title">AnyDoc</div>
+    <div class="tb-spacer"></div>
+    <div class="tb-btn">—</div><div class="tb-btn">□</div><div class="tb-btn close">✕</div>
+  </div>
+  <div class="body">
+    <div class="hero">
+      <h1>文档转 Markdown</h1>
+      <p>把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown</p>
+    </div>
+
+    <div class="drop">
+      <div class="drop-ico">⬆</div>
+      <div class="drop-txt">
+        <div class="drop-main">拖入文档到此处，或 <b>选择文件</b> / <b>选择文件夹</b></div>
+        <div class="drop-sub">支持 docx · pptx · xlsx · pdf · epub · odt · rtf · csv</div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-l"><span class="sec-t">转换队列</span><span class="sec-c">0 个文件</span></div>
+    </div>
+
+    <div class="list" style="background:transparent;border:none;align-items:center;justify-content:center">
+      <div style="text-align:center;color:var(--fg-3);font-size:13px">
+        <div style="font-size:30px;margin-bottom:8px;opacity:.45">📄</div>
+        拖入文件开始转换
+      </div>
+    </div>
+  </div>
+  <div class="foot">
+    <div class="pbar"><i></i></div>
+    <div class="foot-row">
+      <div class="f-left"><span class="f-stat">就绪</span></div>
+      <div class="f-right"><span class="f-pct">0%</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════ 状态 2：转换中 ════════ -->
+<div class="win" id="s2">
+  <div class="titlebar">
+    <div class="tb-icon">A</div><div class="tb-title">AnyDoc</div>
+    <div class="tb-spacer"></div>
+    <div class="tb-btn">—</div><div class="tb-btn">□</div><div class="tb-btn close">✕</div>
+  </div>
+  <div class="body">
+    <div class="hero">
+      <h1>文档转 Markdown</h1>
+      <p>把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown</p>
+    </div>
+
+    <div class="drop hot">
+      <div class="drop-ico" style="background:#fff">⬆</div>
+      <div class="drop-txt">
+        <div class="drop-main">松开即可添加</div>
+        <div class="drop-sub">支持 docx · pptx · xlsx · pdf · epub · odt · rtf · csv</div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-l"><span class="sec-t">转换队列</span><span class="sec-c">6 个文件</span></div>
+      <div class="drop-btns"><button class="btn">清空</button><button class="btn pri" disabled>转换中…</button></div>
+    </div>
+
+    <div class="list"><div class="rows">
+      <div class="row">
+        <div class="fico" style="background:#E8F0FE">📘</div>
+        <div class="f-meta"><div class="f-name">annual-report-2026.docx</div><div class="f-sub">已转换 · 42.8 KB</div></div>
+        <div class="f-size">428 KB</div>
+        <div class="badge ok">✓ 12ms</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#E7F6EC">📗</div>
+        <div class="f-meta"><div class="f-name">Q4-financial-data.xlsx</div><div class="f-sub">已转换 · 8.2 KB</div></div>
+        <div class="f-size">86 KB</div>
+        <div class="badge ok">✓ 8ms</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#FDECE8">📙</div>
+        <div class="f-meta"><div class="f-name">product-launch-deck.pptx</div><div class="f-sub">已转换 · 64.1 KB</div></div>
+        <div class="f-size">2.1 MB</div>
+        <div class="badge ok">✓ 67ms</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#FDEBEC">📕</div>
+        <div class="f-meta"><div class="f-name">vendor-contract.pdf</div><div class="f-sub">转换中…</div></div>
+        <div class="f-size">540 KB</div>
+        <div class="badge run"><span class="dot"></span>转换中</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#FFF4E5">📋</div>
+        <div class="f-meta"><div class="f-name">contacts-list.csv</div><div class="f-sub">转换中…</div></div>
+        <div class="f-size">12 KB</div>
+        <div class="badge run"><span class="dot"></span>转换中</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#F2F4F7">📚</div>
+        <div class="f-meta"><div class="f-name">handbook.epub</div><div class="f-sub">等待转换</div></div>
+        <div class="f-size">1.4 MB</div>
+        <div class="badge wait"><span class="dot"></span>等待</div>
+      </div>
+    </div></div>
+  </div>
+  <div class="foot">
+    <div class="pbar"><i style="width:66%"></i></div>
+    <div class="foot-row">
+      <div class="f-left">
+        <span class="f-stat">正在转换 3/6（2 个进行中）</span>
+      </div>
+      <div class="f-right">
+        <span class="f-note">输出到 D:\Docs\Markdown</span>
+        <span class="f-pct">66%</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════ 状态 3：完成 ════════ -->
+<div class="win" id="s3">
+  <div class="titlebar">
+    <div class="tb-icon">A</div><div class="tb-title">AnyDoc</div>
+    <div class="tb-spacer"></div>
+    <div class="tb-btn">—</div><div class="tb-btn">□</div><div class="tb-btn close">✕</div>
+  </div>
+  <div class="body">
+    <div class="hero">
+      <h1>文档转 Markdown</h1>
+      <p>把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown</p>
+    </div>
+
+    <div class="drop">
+      <div class="drop-ico">⬆</div>
+      <div class="drop-txt">
+        <div class="drop-main">拖入文档到此处，或 <b>选择文件</b> / <b>选择文件夹</b></div>
+        <div class="drop-sub">支持 docx · pptx · xlsx · pdf · epub · odt · rtf · csv</div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-l"><span class="sec-t">转换队列</span><span class="sec-c">4 个文件</span></div>
+      <div class="drop-btns"><button class="btn">清空</button><button class="btn">打开输出目录</button><button class="btn pri">全部转换</button></div>
+    </div>
+
+    <div class="list"><div class="rows">
+      <div class="row">
+        <div class="fico" style="background:#E8F0FE">📘</div>
+        <div class="f-meta"><div class="f-name">annual-report-2026.docx</div><div class="f-sub">已转换 · 42.8 KB → annual-report-2026.md</div></div>
+        <div class="f-size">428 KB</div>
+        <div class="badge ok">✓ 12ms</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#E7F6EC">📗</div>
+        <div class="f-meta"><div class="f-name">Q4-financial-data.xlsx</div><div class="f-sub">已转换 · 8.2 KB → Q4-financial-data.md</div></div>
+        <div class="f-size">86 KB</div>
+        <div class="badge ok">✓ 8ms</div>
+      </div>
+      <div class="row">
+        <div class="fico" style="background:#FDEBEC">📕</div>
+        <div class="f-meta"><div class="f-name">vendor-contract.pdf</div><div class="f-sub">已转换 · 18.4 KB → vendor-contract.md</div></div>
+        <div class="f-size">540 KB</div>
+        <div class="badge ok">✓ 141ms</div>
+      </div>
+      <div class="row" style="background:#FFFBFA">
+        <div class="fico" style="background:#F2F4F7">📕</div>
+        <div class="f-meta"><div class="f-name">scanned-receipt.pdf</div><div class="f-sub">扫描件需 OCR（anydoc 不含 OCR）</div></div>
+        <div class="f-size">1.1 MB</div>
+        <div class="badge err">✗ 需 OCR</div>
+      </div>
+    </div></div>
+  </div>
+  <div class="foot">
+    <div class="pbar ok"><i style="width:100%"></i></div>
+    <div class="foot-row">
+      <div class="f-left">
+        <span class="f-stat">3 成功 · 1 失败 · 0.4s · 已写入 3 个 .md 到 D:\Docs\Markdown</span>
+      </div>
+      <div class="f-right"><span class="f-pct">100%</span></div>
+    </div>
+  </div>
+</div>
+
+</body></html>

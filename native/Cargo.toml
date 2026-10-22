@@ -1,0 +1,51 @@
+[package]
+name = "anydoc-native"
+version = "0.3.0"
+description = "AnyDoc for Windows - 原生窗口版文档转 Markdown 工具"
+authors = ["AnyDoc Team"]
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[[bin]]
+name = "anydoc"
+path = "src/main.rs"
+
+[dependencies]
+anydoc = "0.2.4"          # 官方解析内核 (MIT)
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.4"
+
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_LibraryLoader",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Ole",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_Security",
+  "Win32_UI_Controls",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+# 体积优化
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+strip = true
+incremental = false
+
+[profile.release.package."*"]
+opt-level = "z"

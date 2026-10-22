@@ -1,0 +1,14 @@
+[package]
+name = "anydoc-core-test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "anydoc_core_test"
+path = "src/lib.rs"
+
+[dependencies]
+anydoc = "0.2.4"
+
+[profile.release]
+opt-level = "z"
