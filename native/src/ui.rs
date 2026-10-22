@@ -1,6 +1,7 @@
 // 主窗口：控件创建、布局、消息处理、自绘列表
 //
-// 布局用绝对坐标（窗口 resize 时重算）。所有绘制走双缓冲。
+// 布局用绝对坐标，所有尺寸经 dpi::px() 缩放。
+// 绘制走双缓冲（WM_PAINT 里手动创建兼容 DC）。
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -8,24 +9,22 @@ use std::rc::Rc;
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::Graphics::Gdi::HGDIOBJ;
+use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::dpi;
 use crate::draw::*;
 use crate::icons;
 use crate::state::{AppState, Status, Task, WorkerMsg};
 use crate::worker;
-
-// ── 窗口消息 ──
-const WM_APP_WORKER: u32 = WM_APP + 1; // 后台线程结果
-const WM_APP_TICK: u32 = WM_APP + 2; // 定时轮询
-const TIMER_TICK: usize = 1;
 
 // ── 控件 ID ──
 const ID_LIST: i32 = 100;
@@ -39,16 +38,15 @@ const ID_STATIC_TITLE: i32 = 107;
 const ID_STATIC_SUB: i32 = 108;
 const ID_STATIC_STATUS: i32 = 109;
 const ID_STATIC_PCT: i32 = 110;
-const ID_STATIC_DROP: i32 = 111;
 
-// 布局常量
-const PAD: i32 = 20;
-const LIST_ROW_H: i32 = 46;
-const DROP_Y: i32 = 82;
-const DROP_H: i32 = 56;
-const BTN_Y: i32 = 156;
-const BTN_H: i32 = 30;
-const FOOT_H: i32 = 58;
+// ── 逻辑布局（未缩放）──
+const PAD: i32 = 22;
+const DROP_Y: i32 = 86;
+const DROP_H: i32 = 58;
+const BTN_Y: i32 = 160;
+const BTN_H: i32 = 32;
+const ROW_H: i32 = 48;
+const FOOT_H: i32 = 64;
 
 pub struct Ui {
     pub state: AppState,
@@ -69,7 +67,6 @@ pub struct Fonts {
     pub small: HFONT,
     pub badge: HFONT,
     pub btn: HFONT,
-    pub section: HFONT,
 }
 
 thread_local! {
@@ -101,8 +98,8 @@ pub fn create(hinst: HINSTANCE) -> HWND {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            940,
-            640,
+            980,
+            680,
             None,
             None,
             hinst,
@@ -110,11 +107,14 @@ pub fn create(hinst: HINSTANCE) -> HWND {
         )
         .unwrap_or_default();
 
-        // Win11 圆角 + 深色模式支持
+        // Win11 圆角
         let pref = 2i32; // DWMWCP_ROUND
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as *const std::ffi::c_void, 4);
-        let dark = 1i32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const std::ffi::c_void, 4);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const std::ffi::c_void,
+            4,
+        );
 
         hwnd
     }
@@ -140,9 +140,15 @@ pub unsafe extern "system" fn wnd_proc(
             paint(hwnd);
             LRESULT(0)
         }
-        WM_ERASEBKGND => LRESULT(1), // 自己画背景，避免闪烁
+        WM_ERASEBKGND => LRESULT(1),
         WM_DRAWITEM => {
             draw_item(hwnd, lp);
+            LRESULT(1)
+        }
+        WM_MEASUREITEM => {
+            // 固定行高
+            let mi = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
+            mi.itemHeight = dpi::px(ROW_H) as u32;
             LRESULT(1)
         }
         WM_DROPFILES => {
@@ -159,12 +165,16 @@ pub unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        WM_SETTINGCHANGE => {
-            // 系统主题变化（深色模式切换）
-            let _ = refresh_theme(hwnd);
+        WM_DPICHANGED => {
+            // 跨屏移动：重建字体 + 重新布局
+            let _ = dpi::update_scale(hwnd);
+            rebuild_fonts(hwnd);
+            layout(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
         }
-        WM_APP_WORKER => {
+        WM_SETTINGCHANGE => {
+            let _ = refresh_theme(hwnd);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -180,81 +190,54 @@ pub unsafe extern "system" fn wnd_proc(
     }
 }
 
+const TIMER_TICK: usize = 1;
+
 // ── 创建控件 ──
 unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
     let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
 
-    // 常用控件初始化
+    // 常用控件
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_BAR_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
 
-    // 静态文本
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("STATIC"),
-        w!("文档转 Markdown"),
-        WS_CHILD | WS_VISIBLE,
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(ID_STATIC_TITLE as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    );
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("STATIC"),
-        w!("把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown"),
-        WS_CHILD | WS_VISIBLE,
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(ID_STATIC_SUB as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    );
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("STATIC"),
-        w!("就绪"),
-        WS_CHILD | WS_VISIBLE,
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(ID_STATIC_STATUS as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    );
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("STATIC"),
-        w!("0%"),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(windows::Win32::System::SystemServices::SS_RIGHT.0),
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(ID_STATIC_PCT as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    );
+    // 拖放需要 OLE
+    let _ = OleInitialize(None);
 
-    // 任务列表（自绘）
+    // 静态文本
+    for (id, text) in [
+        (ID_STATIC_TITLE, "文档转 Markdown"),
+        (
+            ID_STATIC_SUB,
+            "把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown",
+        ),
+        (ID_STATIC_STATUS, "就绪"),
+        (ID_STATIC_PCT, "0%"),
+    ] {
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            &windows::core::HSTRING::from(text),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            HMENU(id as isize as *mut std::ffi::c_void),
+            hinst,
+            None,
+        );
+    }
+
+    // 任务列表（自绘，报告模式）
     let hlist = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("LISTBOX"),
         w!(""),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x00000011) | WINDOW_STYLE(0x00000100),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(LBS_OWNERDRAWFIXED as u32) | WINDOW_STYLE(LBS_NOINTEGRALHEIGHT as u32),
         0,
         0,
         0,
@@ -305,57 +288,72 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         );
     }
 
-    // 初始化状态
+    // 初始化
     let ui = Rc::new(RefCell::new(Ui {
         state: AppState::new(),
         theme: Theme::light(),
         hwnd,
         hlist,
         hprogress,
-        fonts: Fonts {
-            title: make_font(20, 600),
-            sub: make_font(13, 400),
-            name: make_font(14, 500),
-            small: make_font(12, 400),
-            badge: make_font(12, 600),
-            btn: make_font(13, 400),
-            section: make_font(14, 600),
-        },
+        fonts: make_fonts(),
         icons: RefCell::new(Vec::new()),
         rx: RefCell::new(None),
         dragging: RefCell::new(false),
     }));
-
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
-    // 应用字体到控件
     apply_fonts(hwnd);
-
-    // Win11 圆角需要窗口无边框？不，用 DWM 即可
     layout(hwnd);
 
-    // 轮询定时器
     let _ = SetTimer(hwnd, TIMER_TICK, 40, None);
-
     Ok(())
+}
+
+fn make_fonts() -> Fonts {
+    Fonts {
+        title: make_font(19, 700),
+        sub: make_font(13, 400),
+        name: make_font(14, 500),
+        small: make_font(12, 400),
+        badge: make_font(12, 600),
+        btn: make_font(13, 400),
+    }
+}
+
+/// 重建字体（DPI 变化时）
+unsafe fn rebuild_fonts(hwnd: HWND) {
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        let Some(ui) = slot.as_ref() else { return };
+        {
+            let mut u = ui.borrow_mut();
+            let f = make_fonts();
+            u.fonts.title = f.title;
+            u.fonts.sub = f.sub;
+            u.fonts.name = f.name;
+            u.fonts.small = f.small;
+            u.fonts.badge = f.badge;
+            u.fonts.btn = f.btn;
+        }
+    });
+    apply_fonts(hwnd);
 }
 
 unsafe fn apply_fonts(hwnd: HWND) {
     UI.with(|slot| {
         let slot = slot.borrow();
         let Some(ui) = slot.as_ref() else { return };
-        let ui = ui.borrow();
-
+        let u = ui.borrow();
         let set = |id: i32, font: HFONT| {
             if let Ok(c) = GetDlgItem(hwnd, id) {
                 SendMessageW(c, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             }
         };
-        set(ID_STATIC_TITLE, ui.fonts.title);
-        set(ID_STATIC_SUB, ui.fonts.sub);
-        set(ID_STATIC_STATUS, ui.fonts.small);
-        set(ID_STATIC_PCT, ui.fonts.badge);
-        set(ID_LIST, ui.fonts.name);
+        set(ID_STATIC_TITLE, u.fonts.title);
+        set(ID_STATIC_SUB, u.fonts.sub);
+        set(ID_STATIC_STATUS, u.fonts.small);
+        set(ID_STATIC_PCT, u.fonts.badge);
+        set(ID_LIST, u.fonts.name);
         for id in [
             ID_BTN_FILES,
             ID_BTN_DIR,
@@ -363,68 +361,70 @@ unsafe fn apply_fonts(hwnd: HWND) {
             ID_BTN_CONVERT,
             ID_BTN_OUT,
         ] {
-            set(id, ui.fonts.btn);
+            set(id, u.fonts.btn);
         }
     });
 }
 
 // ── 布局 ──
 pub unsafe fn layout(hwnd: HWND) {
-    let mut rc = RECT::default();
-    let _ = GetWindowRect(hwnd, &mut rc);
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
-
-    // 去掉标题栏和非客户区
     let mut cr = RECT::default();
     let _ = GetClientRect(hwnd, &mut cr);
     let cw = cr.right - cr.left;
     let ch = cr.bottom - cr.top;
 
-    let move_ctl = |id: i32, x: i32, y: i32, ww: i32, hh: i32| {
+    let pad = dpi::px(PAD);
+    let move_ctl = |id: i32, x: i32, y: i32, w: i32, h: i32| {
         if let Ok(c) = GetDlgItem(hwnd, id) {
-            let _ = SetWindowPos(c, None, x, y, ww, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = SetWindowPos(c, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     };
 
     // 标题区
-    move_ctl(ID_STATIC_TITLE, PAD, 18, 600, 28);
-    move_ctl(ID_STATIC_SUB, PAD, 48, 700, 20);
-
-    // 投放区（自绘区域）—— 用一个透明静态控件占位，位置稍后画
-    move_ctl(ID_STATIC_DROP, PAD, DROP_Y, cw - PAD * 2, DROP_H);
+    move_ctl(ID_STATIC_TITLE, pad, dpi::px(20), dpi::px(520), dpi::px(26));
+    move_ctl(ID_STATIC_SUB, pad, dpi::px(50), dpi::px(700), dpi::px(20));
 
     // 按钮行
-    let btn_y = BTN_Y;
-    let bw = 92;
-    let bh = BTN_H;
-    let mut bx = PAD;
+    let btn_y = dpi::px(BTN_Y);
+    let bw = dpi::px(96);
+    let bh = dpi::px(BTN_H);
+    let mut bx = pad;
     move_ctl(ID_BTN_FILES, bx, btn_y, bw, bh);
-    bx += bw + 8;
-    move_ctl(ID_BTN_DIR, bx, btn_y, bw, bh);
+    bx += bw + dpi::px(8);
+    move_ctl(ID_BTN_DIR, bx, btn_y, dpi::px(108), bh);
 
     // 右侧按钮
-    let mut rx = cw - PAD;
-    rx -= 96;
-    move_ctl(ID_BTN_CONVERT, rx, btn_y, 96, bh);
-    rx -= 74;
-    move_ctl(ID_BTN_CLEAR, rx, btn_y, 66, bh);
-    rx -= 96;
-    move_ctl(ID_BTN_OUT, rx, btn_y, 88, bh);
+    let mut rx = cw - pad;
+    rx -= dpi::px(104);
+    move_ctl(ID_BTN_CONVERT, rx, btn_y, dpi::px(104), bh);
+    rx -= dpi::px(74);
+    move_ctl(ID_BTN_CLEAR, rx, btn_y, dpi::px(66), bh);
+    rx -= dpi::px(100);
+    move_ctl(ID_BTN_OUT, rx, btn_y, dpi::px(92), bh);
 
     // 列表
-    let list_y = btn_y + bh + 12;
-    let foot_h = FOOT_H;
-    let list_h = ch - list_y - foot_h - 8;
-    move_ctl(ID_LIST, PAD, list_y, cw - PAD * 2, list_h.max(80));
+    let list_y = btn_y + bh + dpi::px(12);
+    let foot_h = dpi::px(FOOT_H);
+    let list_h = (ch - list_y - foot_h).max(dpi::px(120));
+    move_ctl(ID_LIST, pad, list_y, cw - pad * 2, list_h);
 
     // 底部
     let foot_y = ch - foot_h;
-    move_ctl(ID_PROGRESS, PAD, foot_y + 4, cw - PAD * 2, 4);
-    move_ctl(ID_STATIC_STATUS, PAD, foot_y + 18, cw - PAD * 2 - 60, 22);
-    move_ctl(ID_STATIC_PCT, cw - PAD - 56, foot_y + 18, 56, 22);
-
-    let _ = w;
+    move_ctl(ID_PROGRESS, pad, foot_y + dpi::px(14), cw - pad * 2, dpi::px(5));
+    move_ctl(
+        ID_STATIC_STATUS,
+        pad,
+        foot_y + dpi::px(28),
+        cw - pad * 2 - dpi::px(64),
+        dpi::px(24),
+    );
+    move_ctl(
+        ID_STATIC_PCT,
+        cw - pad - dpi::px(60),
+        foot_y + dpi::px(28),
+        dpi::px(60),
+        dpi::px(24),
+    );
 }
 
 // ── 绘制 ──
@@ -432,10 +432,15 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    let cw = rc.right - rc.left;
-    let ch = rc.bottom - rc.top;
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    let cw = cr.right - cr.left;
+    let ch = cr.bottom - cr.top;
+
+    // 双缓冲：内存 DC + 位图
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, cw, ch);
+    let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
 
     UI.with(|slot| {
         let slot = slot.borrow();
@@ -445,24 +450,51 @@ unsafe fn paint(hwnd: HWND) {
 
         // 背景
         let bg = CreateSolidBrush(th.bg);
-        FillRect(hdc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
+        FillRect(
+            mem_dc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: cw,
+                bottom: ch,
+            },
+            bg,
+        );
         let _ = DeleteObject(HGDIOBJ(bg.0));
 
-        // 投放区（虚线圆角框 + 文字）
-        draw_dropzone(hdc, &ui, PAD, DROP_Y, cw - PAD * 2, DROP_H, th);
+        // 投放区
+        draw_dropzone(mem_dc, &ui, dpi::px(PAD), dpi::px(DROP_Y), cw - dpi::px(PAD) * 2, dpi::px(DROP_H), th);
 
-        // 列表区边框
-        let list_y = 156 + 30 + 12;
-        let foot_h = FOOT_H;
-        let list_h = ch - list_y - foot_h - 8;
+        // 列表边框
+        let list_y = dpi::px(BTN_Y) + dpi::px(BTN_H) + dpi::px(12);
+        let foot_h = dpi::px(FOOT_H);
+        let list_h = (ch - list_y - foot_h).max(dpi::px(120));
         let lrect = RECT {
-            left: PAD,
+            left: dpi::px(PAD),
             top: list_y,
-            right: cw - PAD,
-            bottom: list_y + list_h.max(80),
+            right: cw - dpi::px(PAD),
+            bottom: list_y + list_h,
         };
-        stroke_round_rect(hdc, &lrect, 10, th.line, 1);
+        stroke_round_rect(mem_dc, &lrect, dpi::px(10), th.line, 1);
+
+        // 底部状态栏（浅色分隔）
+        let foot_y = ch - foot_h;
+        let sep = RECT {
+            left: 0,
+            top: foot_y,
+            right: cw,
+            bottom: foot_y + 1,
+        };
+        let sb = CreateSolidBrush(th.line);
+        FillRect(mem_dc, &sep, sb);
+        let _ = DeleteObject(HGDIOBJ(sb.0));
     });
+
+    // 贴回屏幕
+    let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
+    let _ = SelectObject(mem_dc, old_bmp);
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem_dc);
 
     let _ = EndPaint(hwnd, &ps);
 }
@@ -486,24 +518,66 @@ unsafe fn draw_dropzone(
     let (border, bg) = if hot {
         (th.accent, th.run_bg)
     } else {
-        (th.line, th.card)
+        (th.line, th.drop_bg)
     };
-    fill_round_rect(hdc, &rect, 10, bg);
-    stroke_round_rect(hdc, &rect, 10, border, 1);
+    fill_round_rect(hdc, &rect, dpi::px(10), bg);
+    stroke_round_rect(hdc, &rect, dpi::px(10), border, 1);
 
-    // 文字
+    // 图标（向下箭头）
+    let ix = x + dpi::px(22);
+    let iy = y + h / 2;
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
+    let arrow = "↓";
+    let sz = measure_text(hdc, arrow);
+    let _ = SelectObject(hdc, old);
+    let _ = sz;
+    draw_text(
+        hdc,
+        arrow,
+        ix,
+        iy - dpi::px(14),
+        dpi::px(24),
+        dpi::px(28),
+        if hot { th.accent } else { th.text_mute },
+        DRAW_TEXT_FORMAT(DT_CENTER.0),
+        false,
+    );
+
+    let tx = ix + dpi::px(32);
+    let tw = w - (tx - x) - dpi::px(16);
+
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
     let main = if hot {
-        "松开即可添加".to_string()
+        "松开即可添加文件".to_string()
     } else {
-        "拖入文档到此处，或 选择文件 / 选择文件夹".to_string()
+        "拖入文档到此处，或 点击「选择文件」/「选择文件夹」".to_string()
     };
-    draw_text(hdc, &main, x + 46, y + 10, w - 60, 20, th.text, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+    draw_text(
+        hdc,
+        &main,
+        tx,
+        y + dpi::px(12),
+        tw,
+        dpi::px(22),
+        th.text,
+        DRAW_TEXT_FORMAT(DT_LEFT.0),
+        true,
+    );
+    let _ = SelectObject(hdc, old);
 
-    let old2: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
-    let sub = "支持 docx · pptx · xlsx · pdf · epub · odt · rtf · csv";
-    draw_text(hdc, sub, x + 46, y + 31, w - 60, 18, th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
-    let _ = SelectObject(hdc, old2);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
+    let sub = "支持 docx · pptx · xlsx · pdf · epub · odt · ods · odp · rtf · csv";
+    draw_text(
+        hdc,
+        sub,
+        tx,
+        y + dpi::px(34),
+        tw,
+        dpi::px(18),
+        th.text_mute,
+        DRAW_TEXT_FORMAT(DT_LEFT.0),
+        true,
+    );
     let _ = SelectObject(hdc, old);
 }
 
@@ -547,33 +621,9 @@ unsafe fn draw_item(hwnd: HWND, lp: LPARAM) {
             let _ = DeleteObject(HGDIOBJ(sel.0));
         }
 
-        // 图标（真实系统图标）
-        let icon_x = rc.left + 12;
-        let icon_y = rc.top + (LIST_ROW_H - 28) / 2;
-        let mut icon_drawn = false;
-        if let Some(icons) = ui.icons.borrow().get(idx) {
-            if let Some(ic) = icons {
-                if let Some(hicon) = ic.hicon {
-                    let _ = DrawIconEx(
-                        hdc,
-                        icon_x,
-                        icon_y,
-                        hicon,
-                        24,
-                        24,
-                        0,
-                        None,
-                        DI_NORMAL,
-                    );
-                    icon_drawn = true;
-                }
-            }
-        }
-        if !icon_drawn {
-            draw_icon_placeholder(hdc, icon_x, icon_y, 24, th.line_soft);
-        }
+        let row_h = rc.bottom - rc.top;
 
-        // 状态条（最左侧的色条）
+        // 左侧状态色条
         let bar = CreateSolidBrush(match task.status {
             Status::Done(_) => th.ok,
             Status::Error(_) => th.err,
@@ -585,34 +635,61 @@ unsafe fn draw_item(hwnd: HWND, lp: LPARAM) {
             &RECT {
                 left: rc.left,
                 top: rc.top,
-                right: rc.left + 3,
+                right: rc.left + dpi::px(3),
                 bottom: rc.bottom,
             },
             bar,
         );
         let _ = DeleteObject(HGDIOBJ(bar.0));
 
-        // 文件名
-        let text_left = icon_x + 34;
-        let badge_w = 96;
-        let size_w = 74;
-        let name_w = rc.right - text_left - badge_w - size_w - 20;
+        // 图标
+        let icon_x = rc.left + dpi::px(14);
+        let icon_y = rc.top + (row_h - dpi::px(26)) / 2;
+        let icon_sz = dpi::px(26);
+        let mut icon_drawn = false;
+        if let Some(icons) = ui.icons.borrow().get(idx) {
+            if let Some(ic) = icons {
+                if let Some(hicon) = ic.hicon {
+                    let _ = DrawIconEx(
+                        hdc,
+                        icon_x,
+                        icon_y,
+                        hicon,
+                        icon_sz,
+                        icon_sz,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    );
+                    icon_drawn = true;
+                }
+            }
+        }
+        if !icon_drawn {
+            draw_icon_placeholder(hdc, icon_x, icon_y, icon_sz, th.wait_bg);
+        }
+
+        // 文本区
+        let text_left = icon_x + icon_sz + dpi::px(12);
+        let badge_w = dpi::px(104);
+        let size_w = dpi::px(76);
+        let name_w = (rc.right - text_left - badge_w - size_w - dpi::px(24)).max(dpi::px(60));
 
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
         draw_text(
             hdc,
             &task.name,
             text_left,
-            rc.top + 7,
+            rc.top + dpi::px(7),
             name_w,
-            18,
+            dpi::px(20),
             th.text,
-            DT_LEFT,
+            DRAW_TEXT_FORMAT(DT_LEFT.0),
             true,
         );
+        let _ = SelectObject(hdc, old);
 
-        // 副标题
-        let old2: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
         let sub = match &task.status {
             Status::Done(_) => format!("已转换 · {}", crate::state::fmt_size(task.out_size)),
             Status::Error(e) => e.clone(),
@@ -628,42 +705,42 @@ unsafe fn draw_item(hwnd: HWND, lp: LPARAM) {
             hdc,
             &sub,
             text_left,
-            rc.top + 26,
+            rc.top + dpi::px(27),
             name_w,
-            16,
+            dpi::px(18),
             sub_color,
-            DT_LEFT,
+            DRAW_TEXT_FORMAT(DT_LEFT.0),
             true,
         );
-        let _ = SelectObject(hdc, old2);
+        let _ = SelectObject(hdc, old);
 
         // 大小
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
         draw_text(
             hdc,
             &crate::state::fmt_size(task.size),
-            rc.right - badge_w - size_w - 8,
-            rc.top + 14,
+            rc.right - badge_w - size_w - dpi::px(8),
+            rc.top + (row_h - dpi::px(18)) / 2,
             size_w,
-            18,
+            dpi::px(18),
             th.text_mute,
-            DT_RIGHT,
+            DRAW_TEXT_FORMAT(DT_RIGHT.0),
             true,
         );
+        let _ = SelectObject(hdc, old);
 
         // 状态徽章
-        let (text, fg, bg) = status_style(th, &task.status);
-        let old3: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.badge.0));
+        let (text, fg, bgc) = status_style(th, &task.status);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.badge.0));
         draw_badge(
             hdc,
             &text,
-            rc.right - 12,
-            rc.top + LIST_ROW_H / 2,
+            rc.right - dpi::px(14),
+            rc.top + row_h / 2,
             fg,
-            bg,
+            bgc,
             ui.fonts.badge,
         );
-        let _ = SelectObject(hdc, old3);
-
         let _ = SelectObject(hdc, old);
 
         // 底部分隔线
@@ -688,9 +765,9 @@ unsafe fn on_command(hwnd: HWND, id: i32) {
             UI.with(|slot| {
                 let slot = slot.borrow();
                 if let Some(ui) = slot.as_ref() {
-                    let mut ui = ui.borrow_mut();
-                    ui.state.clear();
-                    ui.icons.borrow_mut().clear();
+                    let mut u = ui.borrow_mut();
+                    u.state.clear();
+                    u.icons.borrow_mut().clear();
                 }
             });
             refresh_list(hwnd);
@@ -700,25 +777,21 @@ unsafe fn on_command(hwnd: HWND, id: i32) {
             UI.with(|slot| {
                 let slot = slot.borrow();
                 if let Some(ui) = slot.as_ref() {
-                    let mut ui = ui.borrow_mut();
-                    if ui.state.running {
+                    let mut u = ui.borrow_mut();
+                    if u.state.running || u.state.tasks.is_empty() {
                         return;
                     }
-                    if ui.state.tasks.is_empty() {
-                        return;
-                    }
-                    // 重置状态，开始
-                    for t in ui.state.tasks.iter_mut() {
+                    for t in u.state.tasks.iter_mut() {
                         t.status = Status::Wait;
                         t.out_size = 0;
                     }
-                    ui.state.running = true;
-                    ui.state.stats = Default::default();
-                    ui.state.stats.total = ui.state.tasks.len();
-                    let tasks = ui.state.tasks.clone();
-                    let out = ui.state.out_dir.clone();
+                    u.state.running = true;
+                    u.state.stats = Default::default();
+                    u.state.stats.total = u.state.tasks.len();
+                    let tasks = u.state.tasks.clone();
+                    let out = u.state.out_dir.clone();
                     let rx = worker::spawn(tasks, out);
-                    *ui.rx.borrow_mut() = Some(rx);
+                    *u.rx.borrow_mut() = Some(rx);
                 }
             });
             refresh_list(hwnd);
@@ -729,10 +802,10 @@ unsafe fn on_command(hwnd: HWND, id: i32) {
                 UI.with(|slot| {
                     let slot = slot.borrow();
                     if let Some(ui) = slot.as_ref() {
-                        let mut ui = ui.borrow_mut();
-                        ui.state.out_dir = Some(dir.clone());
-                        ui.state.out_confirmed = true;
-                        ui.state.status = format!("输出目录: {}", dir.display());
+                        let mut u = ui.borrow_mut();
+                        u.state.out_dir = Some(dir.clone());
+                        u.state.out_confirmed = true;
+                        u.state.status = format!("输出到 {}", dir.display());
                     }
                 });
                 update_status(hwnd);
@@ -770,15 +843,14 @@ unsafe fn on_drop(hwnd: HWND, lp: LPARAM) {
     update_status(hwnd);
 }
 
-/// 加入一组文件
 unsafe fn add_paths(hwnd: HWND, paths: &[PathBuf], rel: &str) {
     let mut added = 0;
     UI.with(|slot| {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
-            let mut ui = ui.borrow_mut();
+            let mut u = ui.borrow_mut();
             for p in paths {
-                if ui.state.add_file(p.clone(), rel.to_string()) {
+                if u.state.add_file(p.clone(), rel.to_string()) {
                     added += 1;
                 }
             }
@@ -790,13 +862,12 @@ unsafe fn add_paths(hwnd: HWND, paths: &[PathBuf], rel: &str) {
     }
 }
 
-/// 加入整个目录（递归）
 unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
     let mut added = 0;
     UI.with(|slot| {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
-            let mut ui = ui.borrow_mut();
+            let mut u = ui.borrow_mut();
             let base = dir.clone();
             for entry in walkdir::WalkDir::new(&base)
                 .max_depth(16)
@@ -813,7 +884,6 @@ unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
                 if !crate::state::is_supported(&ext) {
                     continue;
                 }
-                // 计算相对目录
                 let rel = path
                     .parent()
                     .and_then(|p| p.strip_prefix(&base).ok())
@@ -824,7 +894,7 @@ unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
                 } else {
                     format!("{}/", rel)
                 };
-                if ui.state.add_file(path, rel) {
+                if u.state.add_file(path, rel) {
                     added += 1;
                 }
             }
@@ -836,13 +906,16 @@ unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
     }
 }
 
-/// 重新加载文件图标
 fn load_icons() {
     UI.with(|slot| {
         let slot = slot.borrow();
         let Some(ui) = slot.as_ref() else { return };
         let tasks: Vec<Task> = ui.borrow().state.tasks.clone();
         let mut guard = ui.borrow_mut();
+        // 释放旧图标
+        for ic in guard.icons.borrow().iter().flatten() {
+            icons::destroy(ic);
+        }
         let mut icons = guard.icons.borrow_mut();
         icons.clear();
         for t in tasks {
@@ -851,7 +924,6 @@ fn load_icons() {
     });
 }
 
-/// 重建列表内容
 pub unsafe fn refresh_list(hwnd: HWND) {
     UI.with(|slot| {
         let slot = slot.borrow();
@@ -859,23 +931,22 @@ pub unsafe fn refresh_list(hwnd: HWND) {
         let ui = ui.borrow();
 
         if let Ok(list) = GetDlgItem(hwnd, ID_LIST) {
-            let _ = SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+            SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
             for _ in 0..ui.state.tasks.len() {
-                let _ = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(0));
+                SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(0));
             }
-            // 固定行高
+            // 固定行高：wParam = 高度，lParam = 0xFFFF (应用到所有项)
             SendMessageW(
                 list,
                 LB_SETITEMHEIGHT,
-                WPARAM(LIST_ROW_H as usize),
-                LPARAM(0),
+                WPARAM(dpi::px(ROW_H) as usize),
+                LPARAM(0xFFFF),
             );
             let _ = InvalidateRect(list, None, true);
         }
     });
 }
 
-/// 更新底部状态
 pub unsafe fn update_status(hwnd: HWND) {
     UI.with(|slot| {
         let slot = slot.borrow();
@@ -904,7 +975,7 @@ pub unsafe fn update_status(hwnd: HWND) {
             );
         }
         if let Ok(pb) = GetDlgItem(hwnd, ID_PROGRESS) {
-            let _ = SendMessageW(
+            SendMessageW(
                 pb,
                 PBM_SETPOS,
                 WPARAM(st.stats.percent() as usize),
@@ -912,25 +983,24 @@ pub unsafe fn update_status(hwnd: HWND) {
             );
         }
 
-        // 按钮状态
         if let Ok(b) = GetDlgItem(hwnd, ID_BTN_CONVERT) {
-            let label = if st.running {
-                "转换中…"
-            } else if st.tasks.is_empty() {
-                "开始转换"
-            } else {
-                "开始转换"
-            };
+            let label = if st.running { "转换中…" } else { "开始转换" };
             let _ = SetWindowTextW(b, &windows::core::HSTRING::from(label));
             let _ = EnableWindow(b, !st.running && !st.tasks.is_empty());
         }
         if let Ok(b) = GetDlgItem(hwnd, ID_BTN_CLEAR) {
             let _ = EnableWindow(b, !st.running);
         }
+        if let Ok(b) = GetDlgItem(hwnd, ID_BTN_OUT) {
+            let label = match &st.out_dir {
+                Some(d) => format!("输出: {}", d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
+                None => "输出目录".to_string(),
+            };
+            let _ = SetWindowTextW(b, &windows::core::HSTRING::from(label));
+        }
     });
 }
 
-/// 定时轮询后台结果
 unsafe fn tick(hwnd: HWND) {
     let mut finished = Vec::new();
     let mut all_done = false;
@@ -938,7 +1008,6 @@ unsafe fn tick(hwnd: HWND) {
     UI.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(ui) = slot.as_ref() else { return };
-        // 取出 rx，取完再放回（避免嵌套 borrow）
         let mut rx = ui.borrow_mut().rx.borrow_mut().take();
         if let Some(ref r) = rx {
             while let Ok(msg) = r.try_recv() {
@@ -958,9 +1027,9 @@ unsafe fn tick(hwnd: HWND) {
     UI.with(|slot| {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
-            let mut ui = ui.borrow_mut();
+            let mut u = ui.borrow_mut();
             for (id, result) in finished {
-                if let Some(t) = ui.state.tasks.iter_mut().find(|t| t.id == id) {
+                if let Some(t) = u.state.tasks.iter_mut().find(|t| t.id == id) {
                     match result {
                         Ok((size, _)) => {
                             t.status = Status::Done(size as u64);
@@ -970,20 +1039,19 @@ unsafe fn tick(hwnd: HWND) {
                     }
                 }
             }
-            ui.state.recount();
-            if all_done || (ui.state.stats.total > 0 && ui.state.stats.settled() == ui.state.stats.total) {
-                ui.state.running = false;
-                let s = ui.state.stats.clone();
-                let out = ui
+            u.state.recount();
+            if all_done
+                || (u.state.stats.total > 0 && u.state.stats.settled() == u.state.stats.total)
+            {
+                u.state.running = false;
+                let s = u.state.stats.clone();
+                let out = u
                     .state
                     .out_dir
                     .as_ref()
                     .map(|d| d.display().to_string())
                     .unwrap_or_else(|| "源文件同目录".to_string());
-                ui.state.status = format!(
-                    "{} 成功 · {} 失败 · 输出到 {}",
-                    s.done, s.failed, out
-                );
+                u.state.status = format!("{} 成功 · {} 失败 · 输出到 {}", s.done, s.failed, out);
             }
         }
     });
@@ -998,18 +1066,23 @@ unsafe fn refresh_theme(hwnd: HWND) -> bool {
     UI.with(|slot| {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
-            let mut ui = ui.borrow_mut();
-            ui.theme = if dark { Theme::dark() } else { Theme::light() };
+            let mut u = ui.borrow_mut();
+            u.theme = if dark { Theme::dark() } else { Theme::light() };
         }
     });
+    // 标题栏跟随
+    let flag = i32::from(dark);
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &flag as *const _ as *const std::ffi::c_void,
+        4,
+    );
     let _ = InvalidateRect(hwnd, None, true);
     true
 }
 
-/// 检测系统是否为深色模式
-///
-/// 读注册表 AppsUseLightTheme，0 = 深色。
-/// 这是最可靠的方式（DWM 属性需要真实窗口句柄）。
+/// 检测系统是否为深色模式（读注册表 AppsUseLightTheme）
 pub unsafe fn is_dark_mode() -> bool {
     use windows::Win32::System::Registry::*;
     let mut key = HKEY::default();
@@ -1045,4 +1118,15 @@ pub unsafe fn is_dark_mode() -> bool {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+
+/// 预加载文件（测试 / 便捷启动用）
+pub unsafe fn preload_files(hwnd: HWND, paths: &[PathBuf]) {
+    add_paths(hwnd, paths, "");
+}
+
+/// 预加载目录（测试 / 便捷启动用）
+pub unsafe fn preload_folder(hwnd: HWND, dir: &PathBuf) {
+    add_folder(hwnd, dir);
 }

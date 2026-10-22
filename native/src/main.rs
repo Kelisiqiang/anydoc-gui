@@ -3,6 +3,7 @@
 // 单实例运行：已有实例时激活它，而不是开第二个窗口。
 
 mod dialog;
+mod dpi;
 mod draw;
 mod icons;
 mod state;
@@ -20,12 +21,38 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 fn main() {
-    // 命令行模式：anydoc <文件> [-o 输出目录]
-    // GUI 模式下忽略参数
+    // 参数解析
+    //   anydoc                 → GUI 模式
+    //   anydoc --gui [文件...]  → GUI 模式 + 预加载文件（测试/便捷用）
+    //   anydoc <路径> [-o 目录] → 命令行模式
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
+    let gui_flag = args.iter().any(|a| a == "--gui");
+    if args.len() > 1 && !gui_flag {
         std::process::exit(cli_mode(&args));
     }
+    // --gui 后面跟的文件用于预加载
+    let preload: Vec<PathBuf> = if gui_flag {
+        let mut v = Vec::new();
+        let mut seen = false;
+        for a in &args[1..] {
+            if a == "--gui" {
+                seen = true;
+                continue;
+            }
+            if seen {
+                let p = PathBuf::from(a);
+                if p.exists() {
+                    v.push(p);
+                }
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
+    // DPI 感知必须在创建窗口前
+    dpi::enable_dpi_awareness();
 
     unsafe {
         // 单实例检查
@@ -50,6 +77,17 @@ fn main() {
         let hwnd = ui::create(hinst);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+
+        // 预加载文件
+        if !preload.is_empty() {
+            for p in preload {
+                if p.is_dir() {
+                    ui::preload_folder(hwnd, &p);
+                } else {
+                    ui::preload_files(hwnd, &[p]);
+                }
+            }
+        }
 
         // 消息循环
         let mut msg = MSG::default();
