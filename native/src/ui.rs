@@ -88,11 +88,28 @@ thread_local! {
 pub fn register_class() {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
-        let _ = RegisterClassW(&WNDCLASSW {
+        let res_id = windows::core::PCWSTR(1 as *const u16);
+
+        // 从 exe 资源加载图标：LoadIconW 只能取系统图标，自定义图标要用 LoadImageW
+        let icon_big = LoadImageW(hinst, res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE).ok();
+        let icon_small = LoadImageW(
+            hinst,
+            res_id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            IMAGE_FLAGS(0),
+        )
+        .ok();
+
+        let _ = RegisterClassExW(&WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
+            hIcon: icon_big.map(|h| HICON(h.0)).unwrap_or_default(),
+            hIconSm: icon_small.map(|h| HICON(h.0)).unwrap_or_default(),
             lpszClassName: w!("AnyDocNative"),
             ..Default::default()
         });
@@ -117,6 +134,18 @@ pub fn create(hinst: HINSTANCE) -> HWND {
             None,
         )
         .unwrap_or_default();
+
+        // 应用图标：从 exe 资源里加载（MAKEINTRESOURCE 语义）
+        // 注意：LoadIconW 只能加载系统图标，自定义图标必须用 LoadImageW
+        let res_id = windows::core::PCWSTR(1 as *const u16);
+        // 大图标（任务栏 / Alt+Tab）：32x32
+        if let Ok(h) = LoadImageW(hinst, res_id, IMAGE_ICON, 32, 32, IMAGE_FLAGS(0)) {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h.0 as isize));
+        }
+        // 小图标（标题栏）：16x16
+        if let Ok(h) = LoadImageW(hinst, res_id, IMAGE_ICON, 16, 16, IMAGE_FLAGS(0)) {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h.0 as isize));
+        }
 
         // Win11 圆角
         let pref = 2i32; // DWMWCP_ROUND
