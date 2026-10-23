@@ -122,6 +122,7 @@ impl Theme {
 /// 字体集合（按设计稿的字号层级）
 pub struct Fonts {
     pub brand: HFONT,     // 12 品牌条标题
+    pub mono: HFONT,      // 12 等宽（扩展名徽章 / 大小 / 路径）
     pub h1: HFONT,        // 20 大标题
     pub sub: HFONT,       // 12 副标题
     pub btn: HFONT,       // 12 按钮
@@ -132,6 +133,22 @@ pub struct Fonts {
     pub tag: HFONT,       // 11 徽章
     pub foot: HFONT,      // 12 底栏
     pub big: HFONT,       // 20 大按钮
+}
+
+/// 创建等宽字体（设计稿里扩展名徽章/大小/路径用的就是等宽）
+pub fn make_mono(px: i32, weight: i32) -> HFONT {
+    unsafe {
+        let face: Vec<u16> = "Consolas\0".encode_utf16().collect();
+        CreateFontW(
+            dpi::font_px(px), 0, 0, 0, weight, 0, 0, 0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            0,
+            PCWSTR(face.as_ptr()),
+        )
+    }
 }
 
 /// 创建字体（字号按 DPI 缩放）
@@ -154,11 +171,17 @@ pub fn make_font(px: i32, weight: i32) -> HFONT {
 /// 圆角矩形填充
 pub fn fill_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
     unsafe {
+        // 关键：笔和刷子必须同色。RoundRect 会用「当前笔画」描边，
+        // 如果只换刷子，默认黑笔就会在每个圆角矩形上留一圈黑边。
         let brush = CreateSolidBrush(color);
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(brush.0));
+        let pen = CreatePen(PS_SOLID, 1, color);
+        let old_brush: HGDIOBJ = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_pen: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
         let r = dpi::px(radius).max(1);
         RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, r, r);
-        let _ = SelectObject(hdc, old);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = SelectObject(hdc, old_brush);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
         let _ = DeleteObject(HGDIOBJ(brush.0));
     }
 }
@@ -185,6 +208,7 @@ pub fn dashed_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
     unsafe {
         let pen = CreatePen(PS_SOLID, 1, color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let _ = old;
         let r = dpi::px(radius).max(1);
         let dash = dpi::px(8).max(2);
         let gap = dpi::px(6).max(2);
@@ -253,7 +277,9 @@ pub fn draw_text(
             | if clip { DT_END_ELLIPSIS } else { DRAW_TEXT_FORMAT(0) };
         let mut buf: Vec<u16> = text.encode_utf16().collect();
         DrawTextW(hdc, &mut buf, &mut rc, flags);
-        rc.right - rc.left
+        // 宽度单独测量：DrawTextW 对不同对齐方式修改 rc 的行为不一致，
+        // 直接用返回值会导致后续元素位置算错。
+        measure_text(hdc, text).cx
     }
 }
 
@@ -472,4 +498,124 @@ pub fn cleanup(obj: HGDIOBJ) {
 /// POINT 构造
 pub fn pt(x: i32, y: i32) -> POINT {
     POINT { x, y }
+}
+
+
+/// 最小化图标（横线）
+pub fn draw_min_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        MoveToEx(hdc, cx - size / 2, cy, None);
+        LineTo(hdc, cx + size / 2, cy);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 最大化图标（方框）
+pub fn draw_max_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let h = size / 2;
+        MoveToEx(hdc, cx - h, cy - h, None);
+        LineTo(hdc, cx + h, cy - h);
+        LineTo(hdc, cx + h, cy + h);
+        LineTo(hdc, cx - h, cy + h);
+        LineTo(hdc, cx - h, cy - h);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 还原图标（两个错位的方框）
+pub fn draw_restore_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let h = size / 2;
+        let o = dpi::px(3);
+        // 后层
+        MoveToEx(hdc, cx - h + o, cy - h + o, None);
+        LineTo(hdc, cx + h + o, cy - h + o);
+        LineTo(hdc, cx + h + o, cy + h);
+        // 前层
+        MoveToEx(hdc, cx - h, cy - h + o, None);
+        LineTo(hdc, cx - h, cy + h + o);
+        LineTo(hdc, cx + h - o, cy + h + o);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 关闭图标（叉）
+pub fn draw_close_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let h = size / 2;
+        MoveToEx(hdc, cx - h, cy - h, None);
+        LineTo(hdc, cx + h, cy + h);
+        MoveToEx(hdc, cx + h, cy - h, None);
+        LineTo(hdc, cx - h, cy + h);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+
+/// 云朵上传图标（设计稿的 cloud-upload）
+///
+/// 用采样圆弧 + 折线拼出云轮廓（线性风格，和 lucide 一致），中间叠向上箭头。
+pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(2), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+
+        let w = size as f64;
+        let h = w * 0.60;
+        let base_y = cy + (h * 0.5) as i32;
+        let mid_y = cy - (h * 0.10) as i32;
+
+        // 三段圆弧采样：(中心x, 中心y, 半径, 起始角, 结束角)
+        let arcs: [(f64, f64, f64, f64, f64); 3] = [
+            (cx as f64 - w * 0.30, mid_y as f64, h * 0.42, 100.0, 260.0),
+            (cx as f64 - w * 0.04, mid_y as f64 - h * 0.22, h * 0.52, 190.0, 350.0),
+            (cx as f64 + w * 0.26, mid_y as f64, h * 0.40, 280.0, 440.0),
+        ];
+
+        let mut pts: Vec<POINT> = Vec::new();
+        for (ccx, ccy, r, a0, a1) in arcs {
+            let steps = 10;
+            for i in 0..=steps {
+                let t = a0 + (a1 - a0) * (i as f64 / steps as f64);
+                let rad = t * std::f64::consts::PI / 180.0;
+                pts.push(POINT {
+                    x: (ccx + r * rad.cos()) as i32,
+                    y: (ccy + r * rad.sin()) as i32,
+                });
+            }
+        }
+        // 底边两个端点
+        pts.push(POINT { x: cx + (w * 0.40) as i32, y: base_y });
+        pts.push(POINT { x: cx - (w * 0.40) as i32, y: base_y });
+
+        if !pts.is_empty() {
+            Polyline(hdc, &pts);
+        }
+
+        // 中间向上箭头
+        let ax = cx;
+        let ay_top = mid_y - (h * 0.30) as i32;
+        let ay_bot = base_y - dpi::px(2);
+        MoveToEx(hdc, ax, ay_top, None);
+        LineTo(hdc, ax, ay_bot);
+        MoveToEx(hdc, ax - dpi::px(4), ay_top + dpi::px(5), None);
+        LineTo(hdc, ax, ay_top);
+        LineTo(hdc, ax + dpi::px(4), ay_top + dpi::px(5));
+
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
 }

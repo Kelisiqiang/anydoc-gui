@@ -19,7 +19,7 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETPOS,
     PBS_SMOOTH,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -35,7 +35,7 @@ const PAD: i32 = 24;
 const BRAND_H: i32 = 40;
 const HEAD_H: i32 = 68;
 const FOOT_H: i32 = 64;
-const ROW_H: i32 = 52;
+const ROW_H: i32 = 48;
 const THEAD_H: i32 = 34;
 const SCROLLBAR_W: i32 = 14;
 
@@ -48,6 +48,9 @@ const HIT_FRONT: u32 = 5;
 const HIT_CONVERT: u32 = 6;
 const HIT_ROW_DEL: u32 = 100; // + 行号
 const HIT_ROW_OPEN: u32 = 200; // + 行号
+const HIT_MIN: u32 = 300;
+const HIT_MAX: u32 = 301;
+const HIT_CLOSE: u32 = 302;
 
 /// 可点击区域
 #[derive(Clone, Copy)]
@@ -115,14 +118,16 @@ pub fn register_class() {
 pub fn create(hinst: HINSTANCE) -> HWND {
     unsafe {
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            // WS_EX_APPWINDOW：WS_POPUP 窗口必须带这个才会出现在任务栏 / Alt+Tab
+            WS_EX_APPWINDOW,
             w!("AnyDocNative"),
             w!("AnyDoc - 文档转 Markdown"),
-            WS_OVERLAPPEDWINDOW,
+            // 无边框自绘标题栏（还原设计稿）
+            WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            dpi::px(1000),
-            dpi::px(700),
+            dpi::px(896),
+            dpi::px(640),
             None,
             None,
             hinst,
@@ -180,6 +185,17 @@ pub unsafe extern "system" fn wnd_proc(
             on_click(hwnd, lp);
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+            let l = compute_layout(hwnd);
+            if y >= l.brand.top && y < l.brand.bottom {
+                let maximized = is_maximized(hwnd);
+                let _ = ShowWindow(hwnd, if maximized { SW_RESTORE } else { SW_MAXIMIZE });
+                layout(hwnd);
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             UI.with(|slot| {
                 let slot = slot.borrow();
@@ -210,6 +226,25 @@ pub unsafe extern "system" fn wnd_proc(
             if (wp.0 as usize) == TIMER_TICK {
                 tick(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // WS_POPUP 最大化会铺满整个屏幕（含任务栏），
+            // 这里把最大尺寸限制在「工作区」范围内。
+            let mmi = &mut *(lp.0 as *mut MINMAXINFO);
+            let mut work = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut work as *mut RECT as *mut std::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            mmi.ptMaxPosition.x = 0;
+            mmi.ptMaxPosition.y = 0;
+            mmi.ptMaxSize.x = work.right - work.left;
+            mmi.ptMaxSize.y = work.bottom - work.top;
+            mmi.ptMaxTrackSize.x = work.right - work.left;
+            mmi.ptMaxTrackSize.y = work.bottom - work.top;
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -302,6 +337,7 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
 fn make_fonts() -> Fonts {
     Fonts {
         brand: make_font(12, 500),
+        mono: make_mono(12, 500),
         h1: make_font(20, 700),
         sub: make_font(12, 400),
         btn: make_font(12, 500),
@@ -380,6 +416,25 @@ fn compute_layout(hwnd: HWND) -> Layout {
 fn rebuild_hits(hwnd: HWND, l: &Layout) {
     let mut hits: Vec<Hit> = Vec::new();
     let p = dpi::px(PAD);
+
+    // 标题栏右侧窗口按钮（自绘：最小化 / 最大化 / 关闭）
+    let wb = dpi::px(34);
+    let mut wx = l.brand.right;
+    wx -= wb;
+    hits.push(Hit {
+        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
+        id: HIT_CLOSE,
+    });
+    wx -= wb;
+    hits.push(Hit {
+        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
+        id: HIT_MAX,
+    });
+    wx -= wb;
+    hits.push(Hit {
+        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
+        id: HIT_MIN,
+    });
 
     // 头部右侧三个按钮（从右往左排）
     let btn_y = l.head.top + dpi::px(16);
@@ -505,7 +560,7 @@ unsafe fn paint(hwnd: HWND) {
         FillRect(mem_dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
 
-        draw_brand(mem_dc, &ui, &l);
+        draw_brand(mem_dc, &ui, hwnd, &l);
         draw_head(mem_dc, &ui, &l);
         if ui.state.tasks.is_empty() {
             draw_empty(mem_dc, &ui, &l);
@@ -523,7 +578,7 @@ unsafe fn paint(hwnd: HWND) {
 }
 
 /// ① 品牌条
-unsafe fn draw_brand(hdc: HDC, ui: &Ui, l: &Layout) {
+unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
     let p = dpi::px(PAD);
 
@@ -560,6 +615,40 @@ unsafe fn draw_brand(hdc: HDC, ui: &Ui, l: &Layout) {
     draw_pill(hdc, "LLM Ready", tx + tw + dpi::px(10), l.brand.bottom / 2,
         th.blue, th.blue_bg, ui.fonts.tag, Some(th.blue_border));
     let _ = SelectObject(hdc, old);
+
+    // 窗口按钮（自绘）
+    let hits = ui.hits.borrow();
+    let maximized = is_maximized(hwnd);
+    for id in [HIT_MIN, HIT_MAX, HIT_CLOSE] {
+        let Some(h) = hits.iter().find(|h| h.id == id) else { continue };
+        let is_hot = ui.hot.get() == Some(id);
+        // hover 反馈：关闭按钮红色，其余浅灰
+        if id == HIT_CLOSE {
+            if is_hot {
+                fill_round_rect(hdc, &h.rect, 0, th.red);
+            }
+        } else if is_hot {
+            fill_round_rect(hdc, &h.rect, 0, th.slate_100);
+        }
+        let color = if id == HIT_CLOSE && is_hot {
+            rgb(0xFF, 0xFF, 0xFF)
+        } else {
+            th.slate_500
+        };
+        let cx = (h.rect.left + h.rect.right) / 2;
+        let cy = (h.rect.top + h.rect.bottom) / 2;
+        match id {
+            HIT_MIN => draw_min_icon(hdc, cx, cy, dpi::px(11), color),
+            HIT_MAX => {
+                if maximized {
+                    draw_restore_icon(hdc, cx, cy, dpi::px(11), color);
+                } else {
+                    draw_max_icon(hdc, cx, cy, dpi::px(11), color);
+                }
+            }
+            _ => draw_close_icon(hdc, cx, cy, dpi::px(11), color),
+        }
+    }
 }
 
 /// ② 头部（大标题 + 副标题 + 操作按钮）
@@ -575,7 +664,7 @@ unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
     draw_text(hdc, "将 Word、PowerPoint、Excel、PDF 等文档转换为 LLM 可直接读取的纯净 Markdown",
         l.head.left, l.head.top + dpi::px(28), l.head.right - l.head.left, dpi::px(18),
-        th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+        th.text_dim, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 
     // 三个按钮
@@ -641,8 +730,8 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
         right: cx + box_sz / 2,
         bottom: cy - dpi::px(78) + box_sz,
     };
-    fill_round_rect(hdc, &box_rect, dpi::px(14), th.blue_bg);
-    draw_upload_icon(hdc, cx, box_rect.top + box_sz / 2, dpi::px(28), th.blue);
+    fill_round_rect(hdc, &box_rect, dpi::px(16), th.blue_bg);
+    draw_cloud_upload_icon(hdc, cx, box_rect.top + box_sz / 2, dpi::px(26), th.blue);
 
     // 主文案
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
@@ -675,7 +764,7 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
     for (i, t) in tags.iter().enumerate() {
         let r = RECT { left: tx, top: ty, right: tx + widths[i], bottom: ty + dpi::px(19) };
         fill_round_rect(hdc, &r, dpi::px(4), th.slate_100);
-        draw_text(hdc, t, r.left, r.top, r.right - r.left, r.bottom,
+        draw_text(hdc, t, r.left, r.top, r.right - r.left, r.bottom - r.top,
             th.text_dim, DRAW_TEXT_FORMAT(DT_CENTER.0), false);
         tx += widths[i] + gap;
     }
@@ -708,6 +797,8 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     hline(hdc, hr.left, hr.right, hr.bottom - 1, th.border);
 
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.thead.0));
+    // 设计稿表头用了 tracking-wider（字间距）
+    SetTextCharacterExtra(hdc, dpi::px(1));
     let hy = hr.top;
     draw_text(hdc, "文档名称", name_x, hy, name_w, hr.bottom - hy, th.text_mute,
         DRAW_TEXT_FORMAT(DT_LEFT.0), false);
@@ -717,6 +808,7 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     draw_text(hdc, "操作", l.card.right - dpi::px(60), hy, dpi::px(44), hr.bottom - hy, th.text_mute,
         DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+    SetTextCharacterExtra(hdc, 0);
     let _ = SelectObject(hdc, old);
 
     // 行
@@ -753,9 +845,9 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
 
         // 扩展名徽章
         let (fg, bgc, bd) = ext_style(th, &task.ext);
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
         let tag = task.ext.to_uppercase();
-        let tw = draw_pill(hdc, &tag, name_x, cy, fg, bgc, ui.fonts.tag, bd);
+        let tw = draw_pill(hdc, &tag, name_x, cy, fg, bgc, ui.fonts.mono, bd);
         let _ = SelectObject(hdc, old);
 
         // 文件名
@@ -766,7 +858,7 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         let _ = SelectObject(hdc, old);
 
         // 大小
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
         draw_text(hdc, &crate::state::fmt_size(task.size),
             size_r - dpi::px(60), cy - dpi::px(10), dpi::px(60), dpi::px(20),
             th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
@@ -874,7 +966,7 @@ unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
             .and_then(|u| u.borrow().state.out_dir.as_ref().map(|d| d.display().to_string()))
             .unwrap_or_else(|| "与源文件同目录".to_string())
     });
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
     draw_folder_icon(hdc, od_x + dpi::px(8), fy - dpi::px(5), dpi::px(13), th.text_mute);
     draw_text(hdc, &out_label, od_x + dpi::px(26), fy - dpi::px(13), od_w - dpi::px(80), dpi::px(28),
         th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
@@ -962,9 +1054,28 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
                     .map(|h| h.id)
             })
     });
-    let Some(id) = hit else { return };
+    let Some(id) = hit else {
+        // 点在标题栏空白处 → 交给系统处理拖动
+        if y >= l.brand.top && y < l.brand.bottom {
+            let _ = ReleaseCapture();
+            let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+        }
+        return;
+    };
 
     match id {
+        HIT_MIN => {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        HIT_MAX => {
+            let maximized = is_maximized(hwnd);
+            let _ = ShowWindow(hwnd, if maximized { SW_RESTORE } else { SW_MAXIMIZE });
+            layout(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
+        }
+        HIT_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+        }
         HIT_ADD_FILES => {
             if let Some(paths) = crate::dialog::pick_files(hwnd) {
                 add_paths(hwnd, &paths, "");
@@ -1539,5 +1650,23 @@ pub unsafe fn preload_files(hwnd: HWND, paths: &[PathBuf]) {
 /// 预加载目录（--gui 参数用）
 pub unsafe fn preload_folder(hwnd: HWND, dir: &PathBuf) {
     add_folder(hwnd, dir);
+}
+
+
+
+/// 窗口是否最大化
+unsafe fn is_maximized(hwnd: HWND) -> bool {
+    let mut rc = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rc);
+    // 最大化时窗口 rect 等于工作区
+    let mut work = RECT::default();
+    let _ = SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        Some(&mut work as *mut RECT as *mut std::ffi::c_void),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    );
+    (rc.right - rc.left) >= (work.right - work.left)
+        && (rc.bottom - rc.top) >= (work.bottom - work.top)
 }
 
