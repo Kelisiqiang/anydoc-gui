@@ -16,8 +16,9 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetCapture};
 use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dpi;
@@ -37,6 +38,7 @@ const ID_STATIC_TITLE: i32 = 107;
 const ID_STATIC_SUB: i32 = 108;
 const ID_STATIC_STATUS: i32 = 109;
 const ID_STATIC_PCT: i32 = 110;
+const ID_SCROLL: i32 = 112;
 
 // ── 逻辑布局（未缩放）──
 const PAD: i32 = 22;
@@ -46,6 +48,7 @@ const BTN_Y: i32 = 160;
 const BTN_H: i32 = 32;
 const ROW_H: i32 = 48;
 const FOOT_H: i32 = 64;
+const SCROLLBAR_W: i32 = 18;
 
 pub struct Ui {
     pub state: AppState,
@@ -53,6 +56,7 @@ pub struct Ui {
     pub hwnd: HWND,
     pub hlist: HWND,
     pub hprogress: HWND,
+    pub hscroll: HWND,
     pub fonts: Fonts,
     pub icons: RefCell<Vec<Option<icons::IconEntry>>>,
     pub rx: RefCell<Option<std::sync::mpsc::Receiver<WorkerMsg>>>,
@@ -61,6 +65,10 @@ pub struct Ui {
     pub scroll: i32,
     /// 选中的行索引
     pub selected: Option<usize>,
+    /// 正在拖动滚动条
+    pub dragging_scroll: bool,
+    /// 拖动开始时鼠标 Y 与滚动位置的差值
+    pub scroll_anchor: i32,
 }
 
 pub struct Fonts {
@@ -144,22 +152,54 @@ pub unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_VSCROLL => {
+            // 系统滚动条：读取位置并同步到列表
+            let mut si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..Default::default()
+            };
+            if let Ok(sb) = GetDlgItem(hwnd, ID_SCROLL) {
+                if GetScrollInfo(sb, SCROLLBAR_CONSTANTS(3), &mut si).is_ok() {
+                    set_scroll(hwnd, si.nPos);
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
+            // 滚轮：转发给滚动条控件，由系统统一处理
             let delta = (wp.0 >> 16) as i16;
             let steps = (-delta / WHEEL_DELTA as i16).max(-3).min(3) as i32;
-            UI.with(|slot| {
-                let slot = slot.borrow();
-                if let Some(ui) = slot.as_ref() {
-                    let mut u = ui.borrow_mut();
-                    let max_scroll = (u.state.tasks.len() as i32 - visible_rows(hwnd)).max(0);
-                    u.scroll = (u.scroll + steps).max(0).min(max_scroll);
-                }
-            });
-            let _ = InvalidateRect(hwnd, None, false);
+            let cur = get_scroll(hwnd);
+            let max_scroll = max_scroll(hwnd);
+            let next = (cur + steps * 3).max(0).min(max_scroll);
+            set_scroll(hwnd, next);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             on_click(hwnd, lp);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    ui.borrow_mut().dragging_scroll = false;
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            on_mouse_move(hwnd, lp);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    ui.borrow_mut().dragging_scroll = false;
+                }
+            });
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -175,8 +215,14 @@ pub unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_TIMER => {
-            if (wp.0 as usize) == TIMER_TICK {
-                tick(hwnd);
+            match wp.0 as usize {
+                TIMER_TICK => tick(hwnd),
+                TIMER_FIRST => {
+                    let _ = KillTimer(hwnd, TIMER_FIRST);
+                    layout(hwnd);
+                    let _ = InvalidateRect(hwnd, None, true);
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -206,6 +252,7 @@ pub unsafe extern "system" fn wnd_proc(
 }
 
 const TIMER_TICK: usize = 1;
+const TIMER_FIRST: usize = 2;
 
 // ── 创建控件 ──
 unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
@@ -213,6 +260,27 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
     let _ = dpi::update_scale(hwnd);
 
     let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
+
+    // 关键：UI 状态必须最先初始化。
+    // 后面任何控件创建失败都不能让 UI 处于未初始化状态，
+    // 否则 paint_list 取不到 theme，整个界面会画不出来。
+    let ui = Rc::new(RefCell::new(Ui {
+        state: AppState::new(),
+        theme: Theme::light(),
+        hwnd,
+        hlist: HWND(std::ptr::null_mut()),
+        hprogress: HWND(std::ptr::null_mut()),
+        hscroll: HWND(std::ptr::null_mut()),
+        fonts: make_fonts(),
+        icons: RefCell::new(Vec::new()),
+        rx: RefCell::new(None),
+        dragging: RefCell::new(false),
+        scroll: 0,
+        selected: None,
+        dragging_scroll: false,
+        scroll_anchor: 0,
+    }));
+    UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
     // 常用控件
     let icc = INITCOMMONCONTROLSEX {
@@ -254,7 +322,7 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
     let hlist = HWND(std::ptr::null_mut());
 
     // 进度条
-    let hprogress = CreateWindowExW(
+    let hprogress = match CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("msctls_progress32"),
         w!(""),
@@ -267,7 +335,32 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         HMENU(ID_PROGRESS as isize as *mut std::ffi::c_void),
         hinst,
         None,
-    )?;
+    ) {
+        Ok(h) => h,
+        Err(_) => HWND(std::ptr::null_mut()),
+    };
+
+    // 垂直滚动条（系统控件，支持拖动/箭头/滚轮）
+    let hscroll = match CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("msctls_scrollbar32"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SBS_VERT as u32),
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        HMENU(ID_SCROLL as isize as *mut std::ffi::c_void),
+        hinst,
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            // 滚动条创建失败不影响主功能，降级为隐藏
+            HWND(std::ptr::null_mut())
+        }
+    };
 
     // 按钮
     for (id, label) in [
@@ -293,28 +386,19 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         );
     }
 
-    // 初始化
-    let ui = Rc::new(RefCell::new(Ui {
-        state: AppState::new(),
-        theme: Theme::light(),
-        hwnd,
-        hlist,
-        hprogress,
-        fonts: make_fonts(),
-        icons: RefCell::new(Vec::new()),
-        rx: RefCell::new(None),
-        dragging: RefCell::new(false),
-        scroll: 0,
-        selected: None,
-    }));
-    UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
+    // 把真实句柄写回 UI
+    {
+        let mut u = ui.borrow_mut();
+        u.hlist = hlist;
+        u.hprogress = hprogress;
+        u.hscroll = hscroll;
+    }
 
     apply_fonts(hwnd);
     layout(hwnd);
 
-    // 强制重绘（hbrBackground 为 NULL，Windows 不会自动发 WM_PAINT）
-    let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
-
+    // 延迟首刷：窗口显示后系统才会正确派发 WM_PAINT
+    let _ = SetTimer(hwnd, TIMER_FIRST, 60, None);
     let _ = SetTimer(hwnd, TIMER_TICK, 40, None);
     Ok(())
 }
@@ -416,6 +500,7 @@ pub unsafe fn layout(hwnd: HWND) {
     let foot_h = dpi::px(FOOT_H);
     let list_h = (ch - list_y - foot_h).max(dpi::px(120));
 
+
     // 底部
     let foot_y = ch - foot_h;
     move_ctl(ID_PROGRESS, pad, foot_y + dpi::px(14), cw - pad * 2, dpi::px(5));
@@ -445,23 +530,22 @@ unsafe fn paint(hwnd: HWND) {
     let cw = cr.right - cr.left;
     let ch = cr.bottom - cr.top;
 
+    // 双缓冲：所有绘制做在内存 DC 上，最后一次性贴回屏幕
+    // （避免 GDI 对象状态互相干扰，也不会被子控件覆盖顺序影响）
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, cw, ch);
+    let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+
     // 背景
     let (bg_color, line_color) = UI.with(|slot| {
         let slot = slot.borrow();
         match slot.as_ref() {
-            Some(u) => {
-                let u = u.borrow();
-                (u.theme.bg, u.theme.line)
-            }
-            None => (rgb(0xF3, 0xF3, 0xF6), rgb(0xE4, 0xE7, 0xEC)),
+            Some(u) => { let u = u.borrow(); (u.theme.bg, u.theme.line) }
+            None => (rgb(0xF3,0xF3,0xF6), rgb(0xE4,0xE7,0xEC)),
         }
     });
     let bg = CreateSolidBrush(bg_color);
-    FillRect(
-        hdc,
-        &RECT { left: 0, top: 0, right: cw, bottom: ch },
-        bg,
-    );
+    FillRect(mem_dc, &RECT{left:0,top:0,right:cw,bottom:ch}, bg);
     let _ = DeleteObject(HGDIOBJ(bg.0));
 
     // 投放区
@@ -469,56 +553,49 @@ unsafe fn paint(hwnd: HWND) {
         let drop = UI.with(|slot| {
             let slot = slot.borrow();
             match slot.as_ref() {
-                Some(u) => {
-                    let u = u.borrow();
-                    let hot = *u.dragging.borrow();
-                    let theme = u.theme.clone();
-                    Some((theme, hot, u.fonts.name, u.fonts.small))
-                }
+                Some(u) => { let u = u.borrow(); let hot = *u.dragging.borrow();
+                    Some((u.theme.clone(), hot, u.fonts.name, u.fonts.small)) }
                 None => None,
             }
         });
         if let Some((theme, hot, f_name, f_small)) = drop {
-            draw_dropzone_parts(
-                hdc, &theme, hot, f_name, f_small,
-                dpi::px(PAD), dpi::px(DROP_Y),
-                cw - dpi::px(PAD) * 2, dpi::px(DROP_H),
-            );
+            draw_dropzone_parts(mem_dc, &theme, hot, f_name, f_small,
+                dpi::px(PAD), dpi::px(DROP_Y), cw - dpi::px(PAD)*2, dpi::px(DROP_H));
         }
     }
 
-    // 任务列表（完全自绘）
-    paint_list(hwnd, hdc);
+    // 任务列表（完全自绘，含滚动条）
+    paint_list(hwnd, mem_dc);
 
     // 底部状态栏分隔线
     let foot_y = ch - dpi::px(FOOT_H);
     let sb = CreateSolidBrush(line_color);
-    FillRect(hdc, &RECT { left: 0, top: foot_y, right: cw, bottom: foot_y + 1 }, sb);
+    FillRect(mem_dc, &RECT{left:0,top:foot_y,right:cw,bottom:foot_y+1}, sb);
     let _ = DeleteObject(HGDIOBJ(sb.0));
+
+    // 一次性贴回屏幕
+    let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
+    let _ = SelectObject(mem_dc, old_bmp);
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem_dc);
 
     let _ = EndPaint(hwnd, &ps);
 }
 
 unsafe fn draw_dropzone_parts(
-    hdc: HDC,
-    th: &Theme,
-    hot: bool,
-    name_font: HFONT,
-    small_font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    hdc: HDC, th: &Theme, hot: bool, name_font: HFONT, small_font: HFONT,
+    x: i32, y: i32, w: i32, h: i32,
 ) {
     let rect = RECT { left: x, top: y, right: x + w, bottom: y + h };
     let (border, bg) = if hot { (th.accent, th.run_bg) } else { (th.line, th.drop_bg) };
     fill_round_rect(hdc, &rect, dpi::px(10), bg);
     stroke_round_rect(hdc, &rect, dpi::px(10), border, 1);
 
-    let ix = x + dpi::px(22);
+    // 下箭头
+    let ix = x + dpi::px(24);
     let iy = y + h / 2;
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(name_font.0));
-    draw_text(hdc, "↓", ix, iy - dpi::px(14), dpi::px(24), dpi::px(28),
+    draw_text(hdc, "\u{2193}", ix, iy - dpi::px(14), dpi::px(24), dpi::px(28),
         if hot { th.accent } else { th.text_mute },
         DRAW_TEXT_FORMAT(DT_CENTER.0), false);
     let _ = SelectObject(hdc, old);
@@ -553,10 +630,16 @@ fn list_rect(hwnd: HWND) -> RECT {
         RECT {
             left: dpi::px(PAD),
             top: list_y,
-            right: cw - dpi::px(PAD),
+            // 右侧留出滚动条宽度
+            right: cw - dpi::px(PAD) - SCROLLBAR_W,
             bottom: (ch - foot_h).max(list_y + dpi::px(80)),
         }
     }
+}
+
+/// 客户区宽度
+fn scrolled_cw() -> i32 {
+    0
 }
 
 /// 可见行数
@@ -575,13 +658,6 @@ unsafe fn paint_list(hwnd: HWND, hdc: HDC) {
             None => None,
         }
     });
-    if th.is_none() {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/workspace/anydoc-diag.log") {
-            let _ = writeln!(f, "paint_list: theme is None!");
-        }
-        return;
-    }
     let Some(th) = th else { return };
 
     // 背景 + 边框
@@ -635,7 +711,8 @@ unsafe fn paint_list(hwnd: HWND, hdc: HDC) {
     let badge_x = rect.right - dpi::px(16);
 
     let first = scroll.max(0) as usize;
-    let last = (first + vis as usize + 1).min(tasks.len());
+    // 只画完全在可视区内的行，避免溢出到底部进度条
+    let last = (first + vis as usize).min(tasks.len());
 
     for (idx, task) in tasks.iter().enumerate().take(last).skip(first) {
         let top = rect.top + (idx as i32 - scroll) * row_h;
@@ -773,33 +850,46 @@ unsafe fn paint_list(hwnd: HWND, hdc: HDC) {
 
     }
 
-    // 滚动条
+    // ── 滚动条（自绘，支持拖动）──
     if tasks.len() > vis as usize {
-        let track_x = rect.right - dpi::px(8);
-        let track_h = rect.bottom - rect.top - dpi::px(8);
-        let thumb_h = ((vis as f64 / tasks.len() as f64) * track_h as f64).max(dpi::px(30) as f64) as i32;
-        let max_scroll = (tasks.len() as i32 - vis).max(1);
-        let thumb_y = rect.top + dpi::px(4)
-            + ((scroll as f64 / max_scroll as f64) * (track_h - thumb_h) as f64) as i32;
-        let sb = CreateSolidBrush(th.line);
+        let track_x = rect.right + dpi::px(3);
+        let track_w = dpi::px(10);
+        let track_h = rect.bottom - rect.top;
+
+        // 轨道
+        let tb = CreateSolidBrush(th.line_soft);
         FillRect(
             hdc,
             &RECT {
                 left: track_x,
-                top: rect.top + dpi::px(4),
-                right: track_x + dpi::px(4),
-                bottom: rect.top + dpi::px(4) + track_h,
+                top: rect.top,
+                right: track_x + track_w,
+                bottom: rect.bottom,
             },
-            sb,
+            tb,
         );
-        let _ = DeleteObject(HGDIOBJ(sb.0));
-        let thb = CreateSolidBrush(th.text_mute);
+        let _ = DeleteObject(HGDIOBJ(tb.0));
+
+        // 滑块
+        let ratio = vis as f64 / tasks.len() as f64;
+        let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(30))).min(track_h);
+        let max_scroll = (tasks.len() as i32 - vis).max(1);
+        let pos = (scroll as f64 / max_scroll as f64).clamp(0.0, 1.0);
+        let thumb_y = rect.top + ((pos * (track_h - thumb_h) as f64) as i32);
+
+        // 拖动时高亮
+        let dragging = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|u| u.borrow().dragging_scroll).unwrap_or(false)
+        });
+        let thumb_color = if dragging { th.accent } else { th.text_mute };
+        let thb = CreateSolidBrush(thumb_color);
         FillRect(
             hdc,
             &RECT {
                 left: track_x,
                 top: thumb_y,
-                right: track_x + dpi::px(4),
+                right: track_x + track_w,
                 bottom: thumb_y + thumb_h,
             },
             thb,
@@ -1002,6 +1092,7 @@ pub unsafe fn refresh_list(hwnd: HWND) {
             }
         }
     });
+    sync_scrollbar(hwnd);
     let _ = InvalidateRect(hwnd, None, true);
 }
 
@@ -1012,6 +1103,20 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
     let rect = list_rect(hwnd);
 
     if x < rect.left || x > rect.right || y < rect.top || y > rect.bottom {
+        return;
+    }
+
+    // 点在滚动条上 → 开始拖动
+    if x >= rect.right && x <= rect.right + dpi::px(16) {
+        UI.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(ui) = slot.as_ref() {
+                let mut u = ui.borrow_mut();
+                u.dragging_scroll = true;
+                u.scroll_anchor = y - u.scroll;
+                let _ = SetCapture(hwnd);
+            }
+        });
         return;
     }
 
@@ -1034,6 +1139,62 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
     }
 }
 
+/// 最大可滚动行数
+fn max_scroll(hwnd: HWND) -> i32 {
+    let count = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+    }) as i32;
+    (count - visible_rows(hwnd)).max(0)
+}
+
+/// 读当前滚动位置
+fn get_scroll(hwnd: HWND) -> i32 {
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().scroll).unwrap_or(0)
+    })
+}
+
+/// 设置滚动位置并刷新界面
+unsafe fn set_scroll(hwnd: HWND, pos: i32) {
+    let max = max_scroll(hwnd);
+    let pos = pos.max(0).min(max);
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(ui) = slot.as_ref() {
+            ui.borrow_mut().scroll = pos;
+        }
+    });
+    sync_scrollbar(hwnd);
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// 把滚动位置同步到系统滚动条控件
+fn sync_scrollbar(hwnd: HWND) {
+    unsafe {
+        let Ok(sb) = GetDlgItem(hwnd, ID_SCROLL) else { return };
+        let count = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+        }) as i32;
+        let vis = visible_rows(hwnd);
+        let scroll = get_scroll(hwnd);
+
+        let si = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_POS | SIF_PAGE,
+            nMin: 0,
+            // nMax 是「可滚动到的最大位置」
+            nMax: (count - vis).max(0),
+            nPage: vis as u32,
+            nPos: scroll,
+            nTrackPos: scroll,
+        };
+        SetScrollInfo(sb, SCROLLBAR_CONSTANTS(3), &si as *const SCROLLINFO, true);
+    }
+}
+
 /// 当前滚动偏移
 fn scroll_offset(hwnd: HWND) -> i32 {
     let _ = hwnd;
@@ -1041,6 +1202,49 @@ fn scroll_offset(hwnd: HWND) -> i32 {
         let slot = slot.borrow();
         slot.as_ref().map(|u| u.borrow().scroll).unwrap_or(0)
     })
+}
+
+/// 鼠标移动：拖动滚动条
+unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) {
+    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+    let dragging = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().dragging_scroll).unwrap_or(false)
+    });
+    if !dragging {
+        return;
+    }
+
+    let rect = list_rect(hwnd);
+    let track_h = rect.bottom - rect.top;
+    let vis = visible_rows(hwnd);
+    let count = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+    }) as i32;
+
+    if count <= vis {
+        return;
+    }
+
+    let ratio = vis as f64 / count as f64;
+    let thumb_h = ((ratio * track_h as f64) as i32).max(dpi::px(28));
+    let max_scroll = count - vis;
+    let travel = (track_h - thumb_h).max(1);
+
+    let anchor = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().scroll_anchor).unwrap_or(0)
+    });
+
+    // 滑块跟随鼠标
+    let thumb_y = y - anchor;
+    let ratio_pos = thumb_y as f64 / travel as f64;
+    let new_scroll = ((ratio_pos * max_scroll as f64).round() as i32)
+        .clamp(0, max_scroll);
+
+    set_scroll(hwnd, new_scroll);
 }
 
 /// 键盘：上下移动选中 / Delete 删除
@@ -1186,7 +1390,7 @@ pub unsafe fn update_status(hwnd: HWND) {
 }
 
 unsafe fn tick(hwnd: HWND) {
-    let mut finished = Vec::new();
+    let mut finished: Vec<(usize, u64, Result<(u64, String), String>)> = Vec::new();
     let mut all_done = false;
 
     UI.with(|slot| {
@@ -1196,7 +1400,7 @@ unsafe fn tick(hwnd: HWND) {
         if let Some(ref r) = rx {
             while let Ok(msg) = r.try_recv() {
                 match msg {
-                    WorkerMsg::Finished { id, result } => finished.push((id, result)),
+                    WorkerMsg::Finished { id, elapsed_ms, result } => finished.push((id, elapsed_ms, result)),
                     WorkerMsg::AllDone => all_done = true,
                 }
             }
@@ -1212,11 +1416,12 @@ unsafe fn tick(hwnd: HWND) {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
             let mut u = ui.borrow_mut();
-            for (id, result) in finished {
+            for (id, elapsed_ms, result) in finished {
                 if let Some(t) = u.state.tasks.iter_mut().find(|t| t.id == id) {
                     match result {
                         Ok((size, _)) => {
-                            t.status = Status::Done(size as u64);
+                            // 注意：Status::Done 存的是耗时(毫秒)，字节数放 out_size
+                            t.status = Status::Done(elapsed_ms);
                             t.out_size = size;
                         }
                         Err(e) => t.status = Status::Error(e),

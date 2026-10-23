@@ -12,7 +12,7 @@ pub enum Status {
     Wait,
     /// 正在转换
     Running,
-    /// 转换成功，括号内是耗时毫秒
+    /// 转换成功，括号内是耗时（毫秒）
     Done(u64),
     /// 转换失败，括号内是给用户看的原因
     Error(String),
@@ -127,6 +127,8 @@ pub enum WorkerMsg {
     /// 某个任务完成
     Finished {
         id: usize,
+        /// 耗时（毫秒）
+        elapsed_ms: u64,
         result: Result<(u64, String), String>,
     },
     /// 全部结束

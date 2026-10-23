@@ -243,10 +243,22 @@ pub fn status_style(theme: &Theme, status: &Status) -> (String, COLORREF, COLORR
         Status::Running => ("转换中".to_string(), theme.accent, theme.run_bg),
         Status::Done(ms) => (format!("✓ {}ms", ms), theme.ok, theme.ok_bg),
         Status::Error(e) => {
-            let short = if e.chars().count() > 10 {
-                format!("✗ {}…", e.chars().take(8).collect::<String>())
-            } else {
-                format!("✗ {}", e)
+            // 徽章只放简短标签，完整原因在行副标题里显示
+            let short = match e.as_str() {
+                "需 OCR（anydoc 不含 OCR）" => "✗ 需 OCR".to_string(),
+                "文件已加密" => "✗ 已加密".to_string(),
+                "文件结构损坏" => "✗ 已损坏".to_string(),
+                "超出安全限制" => "✗ 超限".to_string(),
+                "缺少必要内容" => "✗ 缺内容".to_string(),
+                "不支持的格式" => "✗ 不支持".to_string(),
+                "文件读取失败" => "✗ 读取失败".to_string(),
+                _ => {
+                    if e.chars().count() > 8 {
+                        format!("✗ {}…", e.chars().take(6).collect::<String>())
+                    } else {
+                        format!("✗ {}", e)
+                    }
+                }
             };
             (short, theme.err, theme.err_bg)
         }

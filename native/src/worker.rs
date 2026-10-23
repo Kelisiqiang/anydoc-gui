@@ -88,6 +88,7 @@ pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg>
                 };
 
                 // 转换 + 写盘
+                let t_start = std::time::Instant::now();
                 let result = match convert_one(&task.path) {
                     Ok((size, md)) => {
                         // 输出路径（含 rel 与同目录判定）
@@ -97,6 +98,7 @@ pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg>
                             if let Err(e) = std::fs::create_dir_all(parent) {
                                 let _ = tx.send(WorkerMsg::Finished {
                                     id: task.id,
+                                    elapsed_ms: t_start.elapsed().as_millis() as u64,
                                     result: Err(format!("创建目录失败: {}", e)),
                                 });
                                 continue;
@@ -110,7 +112,8 @@ pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg>
                     Err(e) => Err(e),
                 };
 
-                if tx.send(WorkerMsg::Finished { id: task.id, result }).is_err() {
+                let elapsed_ms = t_start.elapsed().as_millis() as u64;
+                if tx.send(WorkerMsg::Finished { id: task.id, elapsed_ms, result }).is_err() {
                     break; // 主线程已关闭
                 }
 

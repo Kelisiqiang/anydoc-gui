@@ -78,7 +78,6 @@ fn main() {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
         let hwnd = ui::create(hinst);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
 
         // 预加载文件
         if !preload.is_empty() {
