@@ -1,0 +1,8 @@
+// Windows 资源脚本：嵌入应用图标
+// 由 build.rs 调用 windres 编译进 exe
+
+// 主图标（多尺寸 16~256）
+1 ICON "resources/anydoc.ico"
+
+// 小尺寸图标（标题栏用）
+2 ICON "resources/anydoc.ico"
