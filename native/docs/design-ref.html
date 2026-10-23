@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AnyDoc - 文档转 Markdown (UI Redesign)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            user-select: none;
+        }
+        .drop-zone-dash {
+            background-image: url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='16' ry='16' stroke='%23CBD5E1FF' stroke-width='2' stroke-dasharray='8%2c 8' stroke-dashoffset='0' stroke-linecap='square'/%3e%3c/svg%3e");
+        }
+        .drop-zone-dash:hover {
+            background-image: url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='16' ry='16' stroke='%233B82F6FF' stroke-width='2' stroke-dasharray='8%2c 8' stroke-dashoffset='0' stroke-linecap='square'/%3e%3c/svg%3e");
+        }
+    </style>
+</head>
+<body class="bg-slate-200 flex items-center justify-center min-h-screen p-6">
+
+    <!-- 软件主窗口容器 -->
+    <div class="w-full max-w-4xl bg-[#F8FAFC] rounded-xl shadow-2xl border border-slate-200/80 overflow-hidden flex flex-col h-[640px]">
+        
+        <!-- 1. 自定义现代标题栏 -->
+        <div class="h-10 bg-white border-b border-slate-100 flex items-center justify-between px-4 select-none">
+            <div class="flex items-center space-x-2.5">
+                <div class="w-5 h-5 rounded bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white font-bold text-xs shadow-sm">
+                    M↓
+                </div>
+                <span class="text-xs font-medium text-slate-700">AnyDoc - 文档转 Markdown</span>
+                <span class="text-[10px] bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded font-medium border border-blue-100">LLM Ready</span>
+            </div>
+            <!-- 演示切换开关 (仅用于原型预览) -->
+            <div class="flex items-center space-x-2 bg-slate-100 px-2 py-0.5 rounded-md">
+                <span class="text-[11px] text-slate-500">预览状态切换：</span>
+                <button onclick="toggleState('empty')" id="btn-empty" class="text-[11px] px-2 py-0.5 rounded bg-white text-slate-800 shadow-sm font-medium transition">空状态</button>
+                <button onclick="toggleState('list')" id="btn-list" class="text-[11px] px-2 py-0.5 rounded text-slate-600 hover:text-slate-900 transition">列表与进度态</button>
+            </div>
+            <!-- 窗口控制按钮 -->
+            <div class="flex items-center space-x-3 text-slate-400">
+                <button class="hover:text-slate-600"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4"></path></svg></button>
+                <button class="hover:text-slate-600"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4h16v16H4z"></path></svg></button>
+                <button class="hover:text-red-500"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg></button>
+            </div>
+        </div>
+    
+        <!-- 2. 顶部头部与工具栏 -->
+        <div class="px-6 pt-5 pb-3 flex items-end justify-between">
+            <div>
+                <h1 class="text-xl font-bold text-slate-800 tracking-tight">文档转 Markdown</h1>
+                <p class="text-xs text-slate-500 mt-1">将 Word、PowerPoint、Excel、PDF 等文档转换为 LLM 可直接读取的纯净 Markdown</p>
+            </div>
+            <!-- 顶部次级操作区（在列表态下尤为实用） -->
+            <div class="flex items-center space-x-2">
+                <button class="inline-flex items-center px-3 py-1.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium rounded-lg shadow-sm transition">
+                    <svg class="w-3.5 h-3.5 mr-1.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                    添加文件
+                </button>
+                <button class="inline-flex items-center px-3 py-1.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium rounded-lg shadow-sm transition">
+                    <svg class="w-3.5 h-3.5 mr-1.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
+                    添加文件夹
+                </button>
+                <button class="inline-flex items-center px-2.5 py-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 text-xs font-medium rounded-lg transition" title="清空列表">
+                    <svg class="w-3.5 h-3.5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                    清空
+                </button>
+            </div>
+        </div>
+    
+        <!-- 3. 核心主工作区 (自适应高度) -->
+        <div class="flex-1 px-6 py-2 overflow-hidden flex flex-col">
+            
+            <!-- 状态 A：空状态（合并后的沉浸式拖拽区） -->
+            <div id="view-empty" class="flex-1 bg-white rounded-2xl drop-zone-dash flex flex-col items-center justify-center p-8 transition-all group cursor-pointer hover:bg-blue-50/20">
+                <div class="w-14 h-14 rounded-2xl bg-blue-50 text-blue-500 flex items-center justify-center mb-4 group-hover:scale-105 group-hover:bg-blue-100 transition-transform">
+                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                </div>
+                <p class="text-sm font-semibold text-slate-700 mb-1">将文档或文件夹拖入此处</p>
+                <p class="text-xs text-slate-400 mb-5">或者通过上方按钮浏览本地文件，支持批量队列处理</p>
+                
+                <!-- 支持的格式胶囊标签 -->
+                <div class="flex flex-wrap items-center justify-center gap-1.5 max-w-md">
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">DOCX</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">PDF</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">PPTX</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">XLSX</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">CSV</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">EPUB</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">RTF</span>
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[11px] font-mono">ODT/ODS/ODP</span>
+                </div>
+            </div>
+    
+            <!-- 状态 B：文件队列状态（默认隐藏，点击顶部切换可查看） -->
+            <div id="view-list" class="hidden flex-1 bg-white rounded-xl border border-slate-200/80 shadow-sm flex flex-col overflow-hidden">
+                <!-- 表头 -->
+                <div class="grid grid-cols-12 gap-4 px-4 py-2.5 bg-slate-50/80 border-b border-slate-100 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    <div class="col-span-6">文档名称</div>
+                    <div class="col-span-2">大小</div>
+                    <div class="col-span-3">转换状态</div>
+                    <div class="col-span-1 text-right">操作</div>
+                </div>
+                <!-- 列表项容器 -->
+                <div class="flex-1 overflow-y-auto divide-y divide-slate-100 text-xs">
+                    <!-- 行 1：已完成 -->
+                    <div class="grid grid-cols-12 gap-4 px-4 py-3 items-center hover:bg-slate-50/50 transition">
+                        <div class="col-span-6 flex items-center space-x-2.5 truncate">
+                            <span class="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded font-mono text-[10px] font-semibold">DOCX</span>
+                            <span class="font-medium text-slate-700 truncate">01_项目工程尽职调查报告_v2.docx</span>
+                        </div>
+                        <div class="col-span-2 text-slate-400 font-mono">4.2 MB</div>
+                        <div class="col-span-3 flex items-center text-emerald-600 font-medium">
+                            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                            转换完成 (1.2s)
+                        </div>
+                        <div class="col-span-1 text-right">
+                            <button class="text-slate-400 hover:text-blue-600" title="打开所在文件夹">📂</button>
+                        </div>
+                    </div>
+                    <!-- 行 2：转换中 -->
+                    <div class="grid grid-cols-12 gap-4 px-4 py-3 items-center bg-blue-50/20">
+                        <div class="col-span-6 flex items-center space-x-2.5 truncate">
+                            <span class="px-1.5 py-0.5 bg-red-50 text-red-600 rounded font-mono text-[10px] font-semibold">PDF</span>
+                            <span class="font-medium text-slate-700 truncate">2026年度机电系统施工图设计说明.pdf</span>
+                        </div>
+                        <div class="col-span-2 text-slate-400 font-mono">18.7 MB</div>
+                        <div class="col-span-3 pr-4">
+                            <div class="flex items-center justify-between text-[11px] text-blue-600 mb-1 font-medium">
+                                <span>正在提取表格...</span>
+                                <span>65%</span>
+                            </div>
+                            <div class="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                <div class="bg-blue-500 h-1.5 rounded-full w-[65%]"></div>
+                            </div>
+                        </div>
+                        <div class="col-span-1 text-right">
+                            <button class="text-slate-300 hover:text-red-500">✕</button>
+                        </div>
+                    </div>
+                    <!-- 行 3：等待中 -->
+                    <div class="grid grid-cols-12 gap-4 px-4 py-3 items-center hover:bg-slate-50/50 transition">
+                        <div class="col-span-6 flex items-center space-x-2.5 truncate">
+                            <span class="px-1.5 py-0.5 bg-emerald-50 text-emerald-600 rounded font-mono text-[10px] font-semibold">XLSX</span>
+                            <span class="font-medium text-slate-700 truncate">主要材料与设备进场计划表.xlsx</span>
+                        </div>
+                        <div class="col-span-2 text-slate-400 font-mono">856 KB</div>
+                        <div class="col-span-3 text-slate-400">排队等待中</div>
+                        <div class="col-span-1 text-right">
+                            <button class="text-slate-300 hover:text-red-500">✕</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+    
+        </div>
+    
+        <!-- 4. 底部一体化控制与状态栏 -->
+        <div class="px-6 py-4 bg-white border-t border-slate-200/80 flex items-center justify-between">
+            
+            <!-- 左侧：输出路径与 LLM 预处理配置 -->
+            <div class="flex items-center space-x-5">
+                <div class="flex items-center space-x-2">
+                    <span class="text-xs text-slate-400">输出目录:</span>
+                    <div class="flex items-center bg-slate-100 hover:bg-slate-200/70 text-slate-700 px-2.5 py-1 rounded-md text-xs font-mono cursor-pointer transition group">
+                        <svg class="w-3.5 h-3.5 mr-1.5 text-slate-400 group-hover:text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
+                        <span>D:\KnowledgeBase\Inbox_MD</span>
+                        <span class="ml-2 text-blue-600 font-sans text-[11px] font-medium">更改</span>
+                    </div>
+                </div>
+                
+                <!-- 针对 LLM 场景的增值微选项 -->
+                <label class="flex items-center space-x-1.5 cursor-pointer text-xs text-slate-600">
+                    <input type="checkbox" checked class="rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                    <span>注入 YAML Frontmatter</span>
+                </label>
+            </div>
+    
+            <!-- 右侧：全局进度与主操作按钮 -->
+            <div class="flex items-center space-x-4">
+                <div id="status-text" class="text-xs text-slate-400 font-medium">
+                    就绪 · 等待添加文档
+                </div>
+                <button class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-xs font-semibold rounded-lg shadow-md shadow-blue-500/20 flex items-center space-x-2 transition transform active:scale-[0.99]">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                    <span>开始转换</span>
+                </button>
+            </div>
+    
+        </div>
+    </div>
+    
+    <script>
+        function toggleState(state) {
+            const emptyView = document.getElementById('view-empty');
+            const listView = document.getElementById('view-list');
+            const btnEmpty = document.getElementById('btn-empty');
+            const btnList = document.getElementById('btn-list');
+            const statusText = document.getElementById('status-text');
+    
+            if (state === 'empty') {
+                emptyView.classList.remove('hidden');
+                listView.classList.add('hidden');
+                btnEmpty.className = "text-[11px] px-2 py-0.5 rounded bg-white text-slate-800 shadow-sm font-medium transition";
+                btnList.className = "text-[11px] px-2 py-0.5 rounded text-slate-600 hover:text-slate-900 transition";
+                statusText.innerHTML = "就绪 · 等待添加文档";
+            } else {
+                emptyView.classList.add('hidden');
+                listView.classList.remove('hidden');
+                btnList.className = "text-[11px] px-2 py-0.5 rounded bg-white text-slate-800 shadow-sm font-medium transition";
+                btnEmpty.className = "text-[11px] px-2 py-0.5 rounded text-slate-600 hover:text-slate-900 transition";
+                statusText.innerHTML = "<span class='text-blue-600'>正在转换 (1/3) · 总进度 45%</span>";
+            }
+        }
+    </script>
+</body>
+</html>

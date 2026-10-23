@@ -1,3 +1,4 @@
+pub mod frontmatter;
 pub mod state;
 
 // 核心逻辑测试 —— 纯 Rust，不依赖 Win32，可在 Linux 上跑
@@ -155,4 +156,38 @@ fn 损坏文件报错而非产出垃圾() {
 #[test]
 fn 不存在的文件报错() {
     assert!(anydoc::to_markdown("/tmp/definitely-not-exist-xyz.docx").is_err());
+}
+
+// ── YAML Frontmatter 测试 ──
+
+#[test]
+fn frontmatter_格式正确() {
+    use std::path::PathBuf;
+    let t = Task::new(1, PathBuf::from("/docs/年度报告.docx"), String::new());
+    let fm = crate::frontmatter::build(&t);
+    assert!(fm.starts_with("---\n"));
+    assert!(fm.ends_with("---"));
+    assert!(fm.contains("title: "));
+    assert!(fm.contains("type: docx"));
+    assert!(fm.contains("size: "));
+    assert!(fm.contains("converted_at: "));
+}
+
+#[test]
+fn frontmatter_注入到正文前() {
+    use std::path::PathBuf;
+    let t = Task::new(1, PathBuf::from("/docs/a.docx"), String::new());
+    let out = crate::frontmatter::inject(&t, "# 标题\n\n正文");
+    assert!(out.starts_with("---\n"));
+    assert!(out.contains("\n\n# 标题"));
+    assert!(out.trim_end().ends_with("正文"));
+}
+
+#[test]
+fn frontmatter_转义特殊字符() {
+    assert_eq!(crate::frontmatter::yaml_str("普通文本"), "普通文本");
+    assert_eq!(crate::frontmatter::yaml_str("a: b"), "\"a: b\"");
+    assert_eq!(crate::frontmatter::yaml_str("has#hash"), "\"has#hash\"");
+    assert_eq!(crate::frontmatter::yaml_str("say \"hi\""), "\"say \\\"hi\\\"\"");
+    assert_eq!(crate::frontmatter::yaml_str(""), "\"\"");
 }

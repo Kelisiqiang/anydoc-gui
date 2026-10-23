@@ -4,6 +4,7 @@
 
 mod dialog;
 mod dpi;
+mod frontmatter;
 mod draw;
 mod icons;
 mod state;

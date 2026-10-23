@@ -1,83 +1,78 @@
-// 主窗口：控件创建、布局、消息处理、自绘列表
+// 主窗口：布局、自绘、命中测试、交互
 //
-// 布局用绝对坐标，所有尺寸经 dpi::px() 缩放。
-// 绘制走双缓冲（WM_PAINT 里手动创建兼容 DC）。
+// 布局完全自绘（不用原生 BUTTON 控件），以匹配设计稿的圆角 + 图标 + 精确间距。
+// 交互通过「命中区域表」实现：布局时记录每块可点击区域，鼠标事件时反查。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::*;
+use windows::Win32::System::Ole::OleInitialize;
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETPOS,
+    PBS_SMOOTH,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetCapture};
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::dpi;
 use crate::draw::*;
+use crate::dpi;
+use crate::frontmatter;
 use crate::icons;
 use crate::state::{AppState, Status, Task, WorkerMsg};
 use crate::worker;
 
-// ── 控件 ID ──
-const ID_BTN_FILES: i32 = 101;
-const ID_BTN_DIR: i32 = 102;
-const ID_BTN_CLEAR: i32 = 103;
-const ID_BTN_CONVERT: i32 = 104;
-const ID_BTN_OUT: i32 = 105;
-const ID_PROGRESS: i32 = 106;
-const ID_STATIC_TITLE: i32 = 107;
-const ID_STATIC_SUB: i32 = 108;
-const ID_STATIC_STATUS: i32 = 109;
-const ID_STATIC_PCT: i32 = 110;
-const ID_SCROLL: i32 = 112;
-
-// ── 逻辑布局（未缩放）──
-const PAD: i32 = 22;
-const DROP_Y: i32 = 86;
-const DROP_H: i32 = 58;
-const BTN_Y: i32 = 160;
-const BTN_H: i32 = 32;
-const ROW_H: i32 = 48;
+// ── 布局常量（逻辑像素）──
+const PAD: i32 = 24;
+const BRAND_H: i32 = 40;
+const HEAD_H: i32 = 68;
 const FOOT_H: i32 = 64;
-const SCROLLBAR_W: i32 = 18;
+const ROW_H: i32 = 52;
+const THEAD_H: i32 = 34;
+const SCROLLBAR_W: i32 = 14;
+
+// ── 命中区 ID ──
+const HIT_ADD_FILES: u32 = 1;
+const HIT_ADD_DIR: u32 = 2;
+const HIT_CLEAR: u32 = 3;
+const HIT_OUTDIR: u32 = 4;
+const HIT_FRONT: u32 = 5;
+const HIT_CONVERT: u32 = 6;
+const HIT_ROW_DEL: u32 = 100; // + 行号
+const HIT_ROW_OPEN: u32 = 200; // + 行号
+
+/// 可点击区域
+#[derive(Clone, Copy)]
+pub struct Hit {
+    pub rect: RECT,
+    pub id: u32,
+}
 
 pub struct Ui {
     pub state: AppState,
     pub theme: Theme,
     pub hwnd: HWND,
-    pub hlist: HWND,
     pub hprogress: HWND,
-    pub hscroll: HWND,
     pub fonts: Fonts,
     pub icons: RefCell<Vec<Option<icons::IconEntry>>>,
     pub rx: RefCell<Option<std::sync::mpsc::Receiver<WorkerMsg>>>,
-    pub dragging: RefCell<bool>,
-    /// 列表滚动偏移（第一个可见行的索引）
-    pub scroll: i32,
-    /// 选中的行索引
-    pub selected: Option<usize>,
-    /// 正在拖动滚动条
-    pub dragging_scroll: bool,
-    /// 拖动开始时鼠标 Y 与滚动位置的差值
-    pub scroll_anchor: i32,
-}
-
-pub struct Fonts {
-    pub title: HFONT,
-    pub sub: HFONT,
-    pub name: HFONT,
-    pub small: HFONT,
-    pub badge: HFONT,
-    pub btn: HFONT,
+    pub dragging: Cell<bool>,
+    pub scroll: Cell<i32>,
+    pub selected: Cell<Option<usize>>,
+    pub dragging_scroll: Cell<bool>,
+    pub scroll_anchor: Cell<i32>,
+    pub hot: Cell<Option<u32>>,
+    pub hits: RefCell<Vec<Hit>>,
+    /// 注入 YAML Frontmatter
+    pub inject_frontmatter: Cell<bool>,
 }
 
 thread_local! {
@@ -90,7 +85,7 @@ pub fn register_class() {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
         let res_id = windows::core::PCWSTR(1 as *const u16);
 
-        // 从 exe 资源加载图标：LoadIconW 只能取系统图标，自定义图标要用 LoadImageW
+        // LoadIconW 只能取系统图标，自定义图标必须用 LoadImageW
         let icon_big = LoadImageW(hinst, res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE).ok();
         let icon_small = LoadImageW(
             hinst,
@@ -126,8 +121,8 @@ pub fn create(hinst: HINSTANCE) -> HWND {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            dpi::px(980),
-            dpi::px(680),
+            dpi::px(1000),
+            dpi::px(700),
             None,
             None,
             hinst,
@@ -135,19 +130,6 @@ pub fn create(hinst: HINSTANCE) -> HWND {
         )
         .unwrap_or_default();
 
-        // 应用图标：从 exe 资源里加载（MAKEINTRESOURCE 语义）
-        // 注意：LoadIconW 只能加载系统图标，自定义图标必须用 LoadImageW
-        let res_id = windows::core::PCWSTR(1 as *const u16);
-        // 大图标（任务栏 / Alt+Tab）：32x32
-        if let Ok(h) = LoadImageW(hinst, res_id, IMAGE_ICON, 32, 32, IMAGE_FLAGS(0)) {
-            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h.0 as isize));
-        }
-        // 小图标（标题栏）：16x16
-        if let Ok(h) = LoadImageW(hinst, res_id, IMAGE_ICON, 16, 16, IMAGE_FLAGS(0)) {
-            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h.0 as isize));
-        }
-
-        // Win11 圆角
         let pref = 2i32; // DWMWCP_ROUND
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -174,6 +156,7 @@ pub unsafe extern "system" fn wnd_proc(
         }
         WM_SIZE => {
             layout(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -181,27 +164,15 @@ pub unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_VSCROLL => {
-            // 系统滚动条：读取位置并同步到列表
-            let mut si = SCROLLINFO {
-                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_ALL,
-                ..Default::default()
-            };
-            if let Ok(sb) = GetDlgItem(hwnd, ID_SCROLL) {
-                if GetScrollInfo(sb, SCROLLBAR_CONSTANTS(3), &mut si).is_ok() {
-                    set_scroll(hwnd, si.nPos);
-                }
-            }
+        WM_DROPFILES => {
+            on_drop(hwnd, lp);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            // 滚轮：转发给滚动条控件，由系统统一处理
             let delta = (wp.0 >> 16) as i16;
             let steps = (-delta / WHEEL_DELTA as i16).max(-3).min(3) as i32;
-            let cur = get_scroll(hwnd);
-            let max_scroll = max_scroll(hwnd);
-            let next = (cur + steps * 3).max(0).min(max_scroll);
+            let cur = get_scroll();
+            let next = (cur + steps * 3).max(0).min(max_scroll(hwnd));
             set_scroll(hwnd, next);
             LRESULT(0)
         }
@@ -213,7 +184,7 @@ pub unsafe extern "system" fn wnd_proc(
             UI.with(|slot| {
                 let slot = slot.borrow();
                 if let Some(ui) = slot.as_ref() {
-                    ui.borrow_mut().dragging_scroll = false;
+                    ui.borrow_mut().dragging_scroll.set(false);
                 }
             });
             LRESULT(0)
@@ -226,7 +197,7 @@ pub unsafe extern "system" fn wnd_proc(
             UI.with(|slot| {
                 let slot = slot.borrow();
                 if let Some(ui) = slot.as_ref() {
-                    ui.borrow_mut().dragging_scroll = false;
+                    ui.borrow_mut().dragging_scroll.set(false);
                 }
             });
             LRESULT(0)
@@ -235,28 +206,13 @@ pub unsafe extern "system" fn wnd_proc(
             on_key(hwnd, wp.0 as u32);
             LRESULT(0)
         }
-        WM_DROPFILES => {
-            on_drop(hwnd, lp);
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            on_command(hwnd, (wp.0 & 0xFFFF) as i32);
-            LRESULT(0)
-        }
         WM_TIMER => {
-            match wp.0 as usize {
-                TIMER_TICK => tick(hwnd),
-                TIMER_FIRST => {
-                    let _ = KillTimer(hwnd, TIMER_FIRST);
-                    layout(hwnd);
-                    let _ = InvalidateRect(hwnd, None, true);
-                }
-                _ => {}
+            if (wp.0 as usize) == TIMER_TICK {
+                tick(hwnd);
             }
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            // 跨屏移动：重建字体 + 重新布局
             let _ = dpi::update_scale(hwnd);
             rebuild_fonts(hwnd);
             layout(hwnd);
@@ -281,76 +237,42 @@ pub unsafe extern "system" fn wnd_proc(
 }
 
 const TIMER_TICK: usize = 1;
-const TIMER_FIRST: usize = 2;
 
 // ── 创建控件 ──
 unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
-    // 关键：必须在创建字体/计算布局之前确定 DPI
-    let _ = dpi::update_scale(hwnd);
-
-    let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
-
-    // 关键：UI 状态必须最先初始化。
-    // 后面任何控件创建失败都不能让 UI 处于未初始化状态，
-    // 否则 paint_list 取不到 theme，整个界面会画不出来。
+    // 关键：UI 状态最先初始化，后续任何失败都不影响
     let ui = Rc::new(RefCell::new(Ui {
         state: AppState::new(),
         theme: Theme::light(),
         hwnd,
-        hlist: HWND(std::ptr::null_mut()),
         hprogress: HWND(std::ptr::null_mut()),
-        hscroll: HWND(std::ptr::null_mut()),
         fonts: make_fonts(),
         icons: RefCell::new(Vec::new()),
         rx: RefCell::new(None),
-        dragging: RefCell::new(false),
-        scroll: 0,
-        selected: None,
-        dragging_scroll: false,
-        scroll_anchor: 0,
+        dragging: Cell::new(false),
+        scroll: Cell::new(0),
+        selected: Cell::new(None),
+        dragging_scroll: Cell::new(false),
+        scroll_anchor: Cell::new(0),
+        hot: Cell::new(None),
+        hits: RefCell::new(Vec::new()),
+        inject_frontmatter: Cell::new(true),
     }));
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
-    // 常用控件
+    let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
+
+    // 通用控件初始化
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_BAR_CLASSES,
+        dwICC: ICC_PROGRESS_CLASS | ICC_BAR_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
 
     // 拖放需要 OLE
     let _ = OleInitialize(None);
 
-    // 静态文本
-    for (id, text) in [
-        (ID_STATIC_TITLE, "文档转 Markdown"),
-        (
-            ID_STATIC_SUB,
-            "把 Word、PowerPoint、Excel、PDF 等文档转成 LLM 能直接读的干净 Markdown",
-        ),
-        (ID_STATIC_STATUS, "就绪"),
-        (ID_STATIC_PCT, "0%"),
-    ] {
-        let _ = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            &windows::core::HSTRING::from(text),
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            0,
-            0,
-            hwnd,
-            HMENU(id as isize as *mut std::ffi::c_void),
-            hinst,
-            None,
-        );
-    }
-
-    // 任务列表完全自绘（不用 ListBox 控件 —— 它会盖住自绘内容）
-    let hlist = HWND(std::ptr::null_mut());
-
-    // 进度条
+    // 底部进度条
     let hprogress = match CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("msctls_progress32"),
@@ -361,192 +283,201 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         0,
         0,
         hwnd,
-        HMENU(ID_PROGRESS as isize as *mut std::ffi::c_void),
+        HMENU(106 as isize as *mut std::ffi::c_void),
         hinst,
         None,
     ) {
         Ok(h) => h,
         Err(_) => HWND(std::ptr::null_mut()),
     };
-
-    // 垂直滚动条（系统控件，支持拖动/箭头/滚轮）
-    let hscroll = match CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("msctls_scrollbar32"),
-        w!(""),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SBS_VERT as u32),
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(ID_SCROLL as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    ) {
-        Ok(h) => h,
-        Err(_) => {
-            // 滚动条创建失败不影响主功能，降级为隐藏
-            HWND(std::ptr::null_mut())
-        }
-    };
-
-    // 按钮
-    for (id, label) in [
-        (ID_BTN_FILES, "选择文件"),
-        (ID_BTN_DIR, "选择文件夹"),
-        (ID_BTN_CLEAR, "清空"),
-        (ID_BTN_CONVERT, "开始转换"),
-        (ID_BTN_OUT, "输出目录"),
-    ] {
-        let _ = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("BUTTON"),
-            &windows::core::HSTRING::from(label),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            0,
-            0,
-            0,
-            0,
-            hwnd,
-            HMENU(id as isize as *mut std::ffi::c_void),
-            hinst,
-            None,
-        );
-    }
-
-    // 把真实句柄写回 UI
     {
         let mut u = ui.borrow_mut();
-        u.hlist = hlist;
         u.hprogress = hprogress;
-        u.hscroll = hscroll;
     }
 
-    apply_fonts(hwnd);
-    layout(hwnd);
-
-    // 延迟首刷：窗口显示后系统才会正确派发 WM_PAINT
-    let _ = SetTimer(hwnd, TIMER_FIRST, 60, None);
     let _ = SetTimer(hwnd, TIMER_TICK, 40, None);
     Ok(())
 }
 
 fn make_fonts() -> Fonts {
     Fonts {
-        title: make_font(19, 700),
-        sub: make_font(13, 400),
-        name: make_font(14, 500),
-        small: make_font(12, 400),
-        badge: make_font(12, 600),
-        btn: make_font(13, 400),
+        brand: make_font(12, 500),
+        h1: make_font(20, 700),
+        sub: make_font(12, 400),
+        btn: make_font(12, 500),
+        btn_bold: make_font(12, 600),
+        thead: make_font(11, 700),
+        name: make_font(13, 500),
+        meta: make_font(12, 400),
+        tag: make_font(11, 600),
+        foot: make_font(12, 400),
+        big: make_font(13, 700),
     }
 }
 
-/// 重建字体（DPI 变化时）
 unsafe fn rebuild_fonts(hwnd: HWND) {
     UI.with(|slot| {
         let slot = slot.borrow();
-        let Some(ui) = slot.as_ref() else { return };
-        {
-            let mut u = ui.borrow_mut();
+        if let Some(ui) = slot.as_ref() {
             let f = make_fonts();
-            u.fonts.title = f.title;
-            u.fonts.sub = f.sub;
-            u.fonts.name = f.name;
-            u.fonts.small = f.small;
-            u.fonts.badge = f.badge;
-            u.fonts.btn = f.btn;
+            let mut u = ui.borrow_mut();
+            u.fonts = f;
         }
     });
-    apply_fonts(hwnd);
+    let _ = hwnd;
 }
 
-unsafe fn apply_fonts(hwnd: HWND) {
+// ── 布局计算 ──
+struct Layout {
+    cw: i32,
+    ch: i32,
+    /// 品牌条
+    brand: RECT,
+    /// 头部
+    head: RECT,
+    /// 工作区
+    work: RECT,
+    /// 底部
+    foot: RECT,
+    /// 表格卡片
+    card: RECT,
+}
+
+fn compute_layout(hwnd: HWND) -> Layout {
+    unsafe {
+        let mut cr = RECT::default();
+        let _ = GetClientRect(hwnd, &mut cr);
+        let cw = cr.right - cr.left;
+        let ch = cr.bottom - cr.top;
+        let p = dpi::px(PAD);
+
+        let brand = RECT { left: 0, top: 0, right: cw, bottom: dpi::px(BRAND_H) };
+        let head = RECT {
+            left: p,
+            top: dpi::px(BRAND_H) + dpi::px(18),
+            right: cw - p,
+            bottom: dpi::px(BRAND_H) + dpi::px(18) + dpi::px(HEAD_H),
+        };
+        let foot = RECT {
+            left: 0,
+            top: ch - dpi::px(FOOT_H),
+            right: cw,
+            bottom: ch,
+        };
+        let work = RECT {
+            left: p,
+            top: head.bottom + dpi::px(6),
+            right: cw - p,
+            bottom: foot.top - dpi::px(8),
+        };
+        let card = work;
+
+        Layout { cw, ch, brand, head, work, foot, card }
+    }
+}
+
+/// 重建命中区
+fn rebuild_hits(hwnd: HWND, l: &Layout) {
+    let mut hits: Vec<Hit> = Vec::new();
+    let p = dpi::px(PAD);
+
+    // 头部右侧三个按钮（从右往左排）
+    let btn_y = l.head.top + dpi::px(16);
+    let bh = dpi::px(32);
+    let mut x = l.head.right;
+    // 清空
+    x -= dpi::px(56);
+    hits.push(Hit {
+        rect: RECT { left: x, top: btn_y, right: x + dpi::px(56), bottom: btn_y + bh },
+        id: HIT_CLEAR,
+    });
+    x -= dpi::px(104) + dpi::px(8);
+    hits.push(Hit {
+        rect: RECT { left: x, top: btn_y, right: x + dpi::px(104), bottom: btn_y + bh },
+        id: HIT_ADD_DIR,
+    });
+    x -= dpi::px(96) + dpi::px(8);
+    hits.push(Hit {
+        rect: RECT { left: x, top: btn_y, right: x + dpi::px(96), bottom: btn_y + bh },
+        id: HIT_ADD_FILES,
+    });
+
+    // 底部：输出目录 / 复选框 / 开始按钮
+    let fy = l.foot.top + dpi::px(20);
+    // 输出目录
+    let od_w = dpi::px(230);
+    hits.push(Hit {
+        rect: RECT { left: p + dpi::px(58), top: fy - dpi::px(12), right: p + dpi::px(58) + od_w, bottom: fy + dpi::px(16) },
+        id: HIT_OUTDIR,
+    });
+    // 复选框
+    let cb_x = p + dpi::px(58) + od_w + dpi::px(20);
+    hits.push(Hit {
+        rect: RECT { left: cb_x, top: fy - dpi::px(10), right: cb_x + dpi::px(200), bottom: fy + dpi::px(14) },
+        id: HIT_FRONT,
+    });
+    // 开始转换按钮
+    let bw = dpi::px(132);
+    hits.push(Hit {
+        rect: RECT { left: l.foot.right - p - bw, top: fy - dpi::px(14), right: l.foot.right - p, bottom: fy + dpi::px(18) },
+        id: HIT_CONVERT,
+    });
+
+    // 列表行（如果非空）
+    let n = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+    });
+    if n > 0 {
+        let rows_top = l.card.top + dpi::px(THEAD_H);
+        let vis = visible_rows(hwnd);
+        let scroll = get_scroll();
+        for i in 0..n {
+            let row_idx = scroll + i as i32;
+            if row_idx < 0 || row_idx >= n as i32 {
+                continue;
+            }
+            if i as i32 >= vis {
+                break;
+            }
+            let top = rows_top + i as i32 * dpi::px(ROW_H);
+            // 删除按钮
+            hits.push(Hit {
+                rect: RECT { left: l.card.right - dpi::px(34), top: top + dpi::px(10), right: l.card.right - dpi::px(14), bottom: top + dpi::px(42) },
+                id: HIT_ROW_DEL + row_idx as u32,
+            });
+            // 打开文件夹
+            hits.push(Hit {
+                rect: RECT { left: l.card.right - dpi::px(58), top: top + dpi::px(10), right: l.card.right - dpi::px(38), bottom: top + dpi::px(42) },
+                id: HIT_ROW_OPEN + row_idx as u32,
+            });
+        }
+    }
+
     UI.with(|slot| {
         let slot = slot.borrow();
-        let Some(ui) = slot.as_ref() else { return };
-        let u = ui.borrow();
-        let set = |id: i32, font: HFONT| {
-            if let Ok(c) = GetDlgItem(hwnd, id) {
-                SendMessageW(c, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            }
-        };
-        set(ID_STATIC_TITLE, u.fonts.title);
-        set(ID_STATIC_SUB, u.fonts.sub);
-        set(ID_STATIC_STATUS, u.fonts.small);
-        set(ID_STATIC_PCT, u.fonts.badge);
-        for id in [
-            ID_BTN_FILES,
-            ID_BTN_DIR,
-            ID_BTN_CLEAR,
-            ID_BTN_CONVERT,
-            ID_BTN_OUT,
-        ] {
-            set(id, u.fonts.btn);
+        if let Some(ui) = slot.as_ref() {
+            *ui.borrow_mut().hits.borrow_mut() = hits;
         }
     });
 }
 
-// ── 布局 ──
 pub unsafe fn layout(hwnd: HWND) {
-    let mut cr = RECT::default();
-    let _ = GetClientRect(hwnd, &mut cr);
-    let cw = cr.right - cr.left;
-    let ch = cr.bottom - cr.top;
-
-    let pad = dpi::px(PAD);
-    let move_ctl = |id: i32, x: i32, y: i32, w: i32, h: i32| {
-        if let Ok(c) = GetDlgItem(hwnd, id) {
-            let _ = SetWindowPos(c, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    };
-
-    // 标题区
-    move_ctl(ID_STATIC_TITLE, pad, dpi::px(20), dpi::px(520), dpi::px(26));
-    move_ctl(ID_STATIC_SUB, pad, dpi::px(50), dpi::px(700), dpi::px(20));
-
-    // 按钮行
-    let btn_y = dpi::px(BTN_Y);
-    let bw = dpi::px(96);
-    let bh = dpi::px(BTN_H);
-    let mut bx = pad;
-    move_ctl(ID_BTN_FILES, bx, btn_y, bw, bh);
-    bx += bw + dpi::px(8);
-    move_ctl(ID_BTN_DIR, bx, btn_y, dpi::px(108), bh);
-
-    // 右侧按钮
-    let mut rx = cw - pad;
-    rx -= dpi::px(104);
-    move_ctl(ID_BTN_CONVERT, rx, btn_y, dpi::px(104), bh);
-    rx -= dpi::px(74);
-    move_ctl(ID_BTN_CLEAR, rx, btn_y, dpi::px(66), bh);
-    rx -= dpi::px(100);
-    move_ctl(ID_BTN_OUT, rx, btn_y, dpi::px(92), bh);
-
-    // 列表
-    let list_y = btn_y + bh + dpi::px(12);
-    let foot_h = dpi::px(FOOT_H);
-    let list_h = (ch - list_y - foot_h).max(dpi::px(120));
-
-
-    // 底部
-    let foot_y = ch - foot_h;
-    move_ctl(ID_PROGRESS, pad, foot_y + dpi::px(14), cw - pad * 2, dpi::px(5));
-    move_ctl(
-        ID_STATIC_STATUS,
-        pad,
-        foot_y + dpi::px(28),
-        cw - pad * 2 - dpi::px(64),
-        dpi::px(24),
-    );
-    move_ctl(
-        ID_STATIC_PCT,
-        cw - pad - dpi::px(60),
-        foot_y + dpi::px(28),
-        dpi::px(60),
-        dpi::px(24),
-    );
+    let l = compute_layout(hwnd);
+    rebuild_hits(hwnd, &l);
+    // 底部进度条（真实控件，压在自绘底栏上）
+    let p = dpi::px(PAD);
+    if let Ok(pb) = GetDlgItem(hwnd, 106) {
+        let _ = SetWindowPos(
+            pb,
+            None,
+            p,
+            l.foot.top - dpi::px(3),
+            l.cw - p * 2,
+            dpi::px(4),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
 }
 
 // ── 绘制 ──
@@ -554,430 +485,511 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
-    let mut cr = RECT::default();
-    let _ = GetClientRect(hwnd, &mut cr);
-    let cw = cr.right - cr.left;
-    let ch = cr.bottom - cr.top;
+    let l = compute_layout(hwnd);
+    let cw = l.cw;
+    let ch = l.ch;
 
-    // 双缓冲：所有绘制做在内存 DC 上，最后一次性贴回屏幕
-    // （避免 GDI 对象状态互相干扰，也不会被子控件覆盖顺序影响）
+    // 双缓冲
     let mem_dc = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
     let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
 
-    // 背景
-    let (bg_color, line_color) = UI.with(|slot| {
+    UI.with(|slot| {
         let slot = slot.borrow();
-        match slot.as_ref() {
-            Some(u) => { let u = u.borrow(); (u.theme.bg, u.theme.line) }
-            None => (rgb(0xF3,0xF3,0xF6), rgb(0xE4,0xE7,0xEC)),
+        let Some(ui) = slot.as_ref() else { return };
+        let ui = ui.borrow();
+        let th = &ui.theme;
+
+        // 背景
+        let bg = CreateSolidBrush(th.bg);
+        FillRect(mem_dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
+        let _ = DeleteObject(HGDIOBJ(bg.0));
+
+        draw_brand(mem_dc, &ui, &l);
+        draw_head(mem_dc, &ui, &l);
+        if ui.state.tasks.is_empty() {
+            draw_empty(mem_dc, &ui, &l);
+        } else {
+            draw_table(mem_dc, &ui, hwnd, &l);
         }
+        draw_foot(mem_dc, &ui, &l);
     });
-    let bg = CreateSolidBrush(bg_color);
-    FillRect(mem_dc, &RECT{left:0,top:0,right:cw,bottom:ch}, bg);
-    let _ = DeleteObject(HGDIOBJ(bg.0));
 
-    // 投放区
-    {
-        let drop = UI.with(|slot| {
-            let slot = slot.borrow();
-            match slot.as_ref() {
-                Some(u) => { let u = u.borrow(); let hot = *u.dragging.borrow();
-                    Some((u.theme.clone(), hot, u.fonts.name, u.fonts.small)) }
-                None => None,
-            }
-        });
-        if let Some((theme, hot, f_name, f_small)) = drop {
-            draw_dropzone_parts(mem_dc, &theme, hot, f_name, f_small,
-                dpi::px(PAD), dpi::px(DROP_Y), cw - dpi::px(PAD)*2, dpi::px(DROP_H));
-        }
-    }
-
-    // 任务列表（完全自绘，含滚动条）
-    paint_list(hwnd, mem_dc);
-
-    // 底部状态栏分隔线
-    let foot_y = ch - dpi::px(FOOT_H);
-    let sb = CreateSolidBrush(line_color);
-    FillRect(mem_dc, &RECT{left:0,top:foot_y,right:cw,bottom:foot_y+1}, sb);
-    let _ = DeleteObject(HGDIOBJ(sb.0));
-
-    // 一次性贴回屏幕
     let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
     let _ = SelectObject(mem_dc, old_bmp);
     let _ = DeleteObject(HGDIOBJ(bmp.0));
     let _ = DeleteDC(mem_dc);
-
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn draw_dropzone_parts(
-    hdc: HDC, th: &Theme, hot: bool, name_font: HFONT, small_font: HFONT,
-    x: i32, y: i32, w: i32, h: i32,
-) {
-    let rect = RECT { left: x, top: y, right: x + w, bottom: y + h };
-    let (border, bg) = if hot { (th.accent, th.run_bg) } else { (th.line, th.drop_bg) };
-    fill_round_rect(hdc, &rect, dpi::px(10), bg);
-    stroke_round_rect(hdc, &rect, dpi::px(10), border, 1);
+/// ① 品牌条
+unsafe fn draw_brand(hdc: HDC, ui: &Ui, l: &Layout) {
+    let th = &ui.theme;
+    let p = dpi::px(PAD);
 
-    // 下箭头
-    let ix = x + dpi::px(24);
-    let iy = y + h / 2;
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(name_font.0));
-    draw_text(hdc, "\u{2193}", ix, iy - dpi::px(14), dpi::px(24), dpi::px(28),
-        if hot { th.accent } else { th.text_mute },
-        DRAW_TEXT_FORMAT(DT_CENTER.0), false);
+    // 白底 + 底边框
+    let card = CreateSolidBrush(th.card);
+    FillRect(hdc, &l.brand, card);
+    let _ = DeleteObject(HGDIOBJ(card.0));
+    hline(hdc, l.brand.left, l.brand.right, l.brand.bottom - 1, th.border);
+
+    // Logo（圆角方块 + M↓）
+    let logo_sz = dpi::px(20);
+    let logo = RECT {
+        left: p,
+        top: (l.brand.bottom - logo_sz) / 2,
+        right: p + logo_sz,
+        bottom: (l.brand.bottom + logo_sz) / 2,
+    };
+    fill_round_rect(hdc, &logo, dpi::px(5), th.blue);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+    draw_text(hdc, "M↓", logo.left, logo.top, logo_sz, logo_sz,
+        rgb(0xFF, 0xFF, 0xFF), DRAW_TEXT_FORMAT(DT_CENTER.0), false);
     let _ = SelectObject(hdc, old);
 
-    let tx = ix + dpi::px(32);
-    let tw = w - (tx - x) - dpi::px(16);
-
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(name_font.0));
-    let main = if hot { "松开即可添加文件".to_string() }
-               else { "拖入文档到此处，或 点击「选择文件」/「选择文件夹」".to_string() };
-    draw_text(hdc, &main, tx, y + dpi::px(12), tw, dpi::px(22), th.text,
-        DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+    // 标题
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.brand.0));
+    let tx = logo.right + dpi::px(10);
+    let title = "AnyDoc - 文档转 Markdown";
+    let tw = draw_text(hdc, title, tx, l.brand.top, dpi::px(240), l.brand.bottom - l.brand.top,
+        th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(small_font.0));
-    let sub = "支持 docx · pptx · xlsx · pdf · epub · odt · ods · odp · rtf · csv";
-    draw_text(hdc, sub, tx, y + dpi::px(34), tw, dpi::px(18), th.text_mute,
-        DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+    // LLM Ready 徽章
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+    draw_pill(hdc, "LLM Ready", tx + tw + dpi::px(10), l.brand.bottom / 2,
+        th.blue, th.blue_bg, ui.fonts.tag, Some(th.blue_border));
     let _ = SelectObject(hdc, old);
 }
 
-// ── 自绘列表 ──
-/// 计算列表区域矩形
-fn list_rect(hwnd: HWND) -> RECT {
-    unsafe {
-        let mut cr = RECT::default();
-        let _ = GetClientRect(hwnd, &mut cr);
-        let cw = cr.right - cr.left;
-        let ch = cr.bottom - cr.top;
-        let list_y = dpi::px(BTN_Y) + dpi::px(BTN_H) + dpi::px(12);
-        let foot_h = dpi::px(FOOT_H);
-        RECT {
-            left: dpi::px(PAD),
-            top: list_y,
-            // 右侧留出滚动条宽度
-            right: cw - dpi::px(PAD) - SCROLLBAR_W,
-            bottom: (ch - foot_h).max(list_y + dpi::px(80)),
-        }
-    }
-}
+/// ② 头部（大标题 + 副标题 + 操作按钮）
+unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
+    let th = &ui.theme;
+    let p = dpi::px(PAD);
 
-/// 客户区宽度
-fn scrolled_cw() -> i32 {
-    0
-}
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.h1.0));
+    draw_text(hdc, "文档转 Markdown", l.head.left, l.head.top, dpi::px(400), dpi::px(28),
+        th.slate_800, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
 
-/// 可见行数
-fn visible_rows(hwnd: HWND) -> i32 {
-    let r = list_rect(hwnd);
-    ((r.bottom - r.top) / dpi::px(ROW_H)).max(1)
-}
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
+    draw_text(hdc, "将 Word、PowerPoint、Excel、PDF 等文档转换为 LLM 可直接读取的纯净 Markdown",
+        l.head.left, l.head.top + dpi::px(28), l.head.right - l.head.left, dpi::px(18),
+        th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
 
-/// 绘制整个任务列表（完全自绘）
-unsafe fn paint_list(hwnd: HWND, hdc: HDC) {
-    let rect = list_rect(hwnd);
-    let th: Option<Theme> = UI.with(|slot| {
-        let slot = slot.borrow();
-        match slot.as_ref() {
-            Some(ui) => Some(ui.borrow().theme.clone()),
-            None => None,
-        }
-    });
-    let Some(th) = th else { return };
-
-    // 背景 + 边框
-    let bg = CreateSolidBrush(th.card);
-    FillRect(hdc, &rect, bg);
-    let _ = DeleteObject(HGDIOBJ(bg.0));
-    stroke_round_rect(hdc, &rect, dpi::px(10), th.line, 1);
-
-    let (tasks, scroll, selected) = UI.with(|slot| {
-        let slot = slot.borrow();
-        let Some(ui) = slot.as_ref() else { return (Vec::new(), 0, None) };
-        let u = ui.borrow();
-        (u.state.tasks.clone(), u.scroll, u.selected)
-    });
-
-
-    if tasks.is_empty() {
-        // 空状态
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(UI.with(|s| { let s=s.borrow(); s.as_ref().map(|u| u.borrow().fonts.name.0).unwrap_or(std::ptr::null_mut()) }).into()));
-        let msg = "把文档拖进来，或点击上方按钮选择文件";
-        let sz = measure_text(hdc, msg);
-        draw_text(
-            hdc,
-            msg,
-            rect.left + (rect.right - rect.left - sz.cx) / 2,
-            rect.top + (rect.bottom - rect.top) / 2 - dpi::px(10),
-            sz.cx + 2,
-            dpi::px(20),
-            th.text_mute,
-            DRAW_TEXT_FORMAT(DT_LEFT.0),
-            false,
-        );
-        let _ = SelectObject(hdc, old);
-        return;
-    }
-
-    // 注：不使用 IntersectClipRect —— 调用失败会把裁剪区置空，导致所有绘制不可见
-    // 行本身都画在列表矩形内，不会溢出
-
-    let row_h = dpi::px(ROW_H);
-    let vis = visible_rows(hwnd);
-
-    // 列位置（固定，不随内容变化）
-    let icon_x = rect.left + dpi::px(16);
-    let icon_sz = dpi::px(26);
-    let text_left = icon_x + icon_sz + dpi::px(12);
-    let badge_w = dpi::px(104);
-    let size_w = dpi::px(78);
-    let name_w = (rect.right - text_left - badge_w - size_w - dpi::px(30)).max(dpi::px(80));
-    let size_x = rect.right - badge_w - size_w - dpi::px(12);
-    let badge_x = rect.right - dpi::px(16);
-
-    let first = scroll.max(0) as usize;
-    // 只画完全在可视区内的行，避免溢出到底部进度条
-    let last = (first + vis as usize).min(tasks.len());
-
-    for (idx, task) in tasks.iter().enumerate().take(last).skip(first) {
-        let top = rect.top + (idx as i32 - scroll) * row_h;
-        if top + row_h < rect.top || top > rect.bottom {
-            continue;
-        }
-        let row_rect = RECT {
-            left: rect.left,
-            top,
-            right: rect.right,
-            bottom: top + row_h,
+    // 三个按钮
+    let hits = ui.hits.borrow();
+    for (id, label, icon) in [
+        (HIT_ADD_FILES, "添加文件", 0u8),
+        (HIT_ADD_DIR, "添加文件夹", 1u8),
+        (HIT_CLEAR, "清空", 2u8),
+    ] {
+        let Some(h) = hits.iter().find(|h| h.id == id) else { continue };
+        let is_hot = ui.hot.get() == Some(id);
+        let is_clear = id == HIT_CLEAR;
+        let (fg, bg) = if is_clear {
+            (if is_hot { th.red } else { th.text_mute }, if is_hot { th.red_bg } else { th.card })
+        } else {
+            (th.slate_700, if is_hot { th.slate_100 } else { th.card })
         };
+        fill_round_rect(hdc, &h.rect, dpi::px(8), bg);
+        if !is_clear {
+            stroke_round_rect(hdc, &h.rect, dpi::px(8), th.border, 1);
+        }
+
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn.0));
+        let ty = (h.rect.top + h.rect.bottom) / 2;
+        let mut tx = h.rect.left + dpi::px(12);
+        match icon {
+            0 => {
+                draw_plus_icon(hdc, tx + dpi::px(7), ty, dpi::px(14), th.blue);
+                tx += dpi::px(20);
+            }
+            1 => {
+                draw_folder_icon(hdc, tx, ty - dpi::px(5), dpi::px(14), th.amber);
+                tx += dpi::px(20);
+            }
+            _ => {
+                tx += dpi::px(2);
+            }
+        }
+        draw_text(hdc, label, tx, h.rect.top, h.rect.right - tx, h.rect.bottom - h.rect.top,
+            fg, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+        let _ = SelectObject(hdc, old);
+    }
+}
+
+/// ③ 空状态（沉浸式拖拽区）
+unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
+    let th = &ui.theme;
+    let card = CreateSolidBrush(th.card);
+    FillRect(hdc, &l.card, card);
+    let _ = DeleteObject(HGDIOBJ(card.0));
+
+    let hot = ui.dragging.get();
+    dashed_round_rect(hdc, &l.card, dpi::px(14), if hot { th.blue } else { th.slate_300 });
+
+    let cx = (l.card.left + l.card.right) / 2;
+    let cy = (l.card.top + l.card.bottom) / 2;
+
+    // 图标块
+    let box_sz = dpi::px(56);
+    let box_rect = RECT {
+        left: cx - box_sz / 2,
+        top: cy - dpi::px(78),
+        right: cx + box_sz / 2,
+        bottom: cy - dpi::px(78) + box_sz,
+    };
+    fill_round_rect(hdc, &box_rect, dpi::px(14), th.blue_bg);
+    draw_upload_icon(hdc, cx, box_rect.top + box_sz / 2, dpi::px(28), th.blue);
+
+    // 主文案
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
+    let sz = measure_text(hdc, "将文档或文件夹拖入此处");
+    draw_text(hdc, "将文档或文件夹拖入此处",
+        cx - sz.cx / 2, box_rect.bottom + dpi::px(20), sz.cx + 4, dpi::px(20),
+        th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
+    let t2 = "或者通过上方按钮浏览本地文件，支持批量队列处理";
+    let sz2 = measure_text(hdc, t2);
+    draw_text(hdc, t2,
+        cx - sz2.cx / 2, box_rect.bottom + dpi::px(44), sz2.cx + 4, dpi::px(18),
+        th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    // 格式胶囊
+    let tags = ["DOCX", "PDF", "PPTX", "XLSX", "CSV", "EPUB", "RTF", "ODT/ODS/ODP"];
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+    let mut widths = Vec::new();
+    for t in tags {
+        let s = measure_text(hdc, t);
+        widths.push(s.cx + dpi::px(14));
+    }
+    let gap = dpi::px(6);
+    let total: i32 = widths.iter().sum::<i32>() + gap * (tags.len() as i32 - 1);
+    let mut tx = cx - total / 2;
+    let ty = box_rect.bottom + dpi::px(76);
+    for (i, t) in tags.iter().enumerate() {
+        let r = RECT { left: tx, top: ty, right: tx + widths[i], bottom: ty + dpi::px(19) };
+        fill_round_rect(hdc, &r, dpi::px(4), th.slate_100);
+        draw_text(hdc, t, r.left, r.top, r.right - r.left, r.bottom,
+            th.text_dim, DRAW_TEXT_FORMAT(DT_CENTER.0), false);
+        tx += widths[i] + gap;
+    }
+    let _ = SelectObject(hdc, old);
+}
+
+/// ④ 表格（列表态）
+unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
+    let th = &ui.theme;
+    let p = dpi::px(PAD);
+
+    // 卡片
+    let card = CreateSolidBrush(th.card);
+    FillRect(hdc, &l.card, card);
+    let _ = DeleteObject(HGDIOBJ(card.0));
+    stroke_round_rect(hdc, &l.card, dpi::px(12), th.border, 1);
+
+    // 列位置
+    let name_x = l.card.left + dpi::px(16);
+    let name_w = (l.card.right - l.card.left) * 46 / 100;
+    let size_r = l.card.left + (l.card.right - l.card.left) * 62 / 100;
+    let status_x = l.card.left + (l.card.right - l.card.left) * 64 / 100;
+    let status_w = (l.card.right - l.card.left) * 26 / 100;
+
+    // 表头
+    let hr = RECT { left: l.card.left, top: l.card.top, right: l.card.right, bottom: l.card.top + dpi::px(THEAD_H) };
+    let hb = CreateSolidBrush(th.header_bg);
+    FillRect(hdc, &hr, hb);
+    let _ = DeleteObject(HGDIOBJ(hb.0));
+    hline(hdc, hr.left, hr.right, hr.bottom - 1, th.border);
+
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.thead.0));
+    let hy = hr.top;
+    draw_text(hdc, "文档名称", name_x, hy, name_w, hr.bottom - hy, th.text_mute,
+        DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    draw_text(hdc, "大小", size_r - dpi::px(60), hy, dpi::px(60), hr.bottom - hy, th.text_mute,
+        DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+    draw_text(hdc, "转换状态", status_x, hy, status_w, hr.bottom - hy, th.text_mute,
+        DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    draw_text(hdc, "操作", l.card.right - dpi::px(60), hy, dpi::px(44), hr.bottom - hy, th.text_mute,
+        DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    // 行
+    let tasks = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.clone()).unwrap_or_default()
+    });
+    let scroll = get_scroll();
+    let vis = visible_rows(hwnd);
+    let rows_top = l.card.top + dpi::px(THEAD_H);
+    let row_h = dpi::px(ROW_H);
+    let sel = ui.selected.get();
+
+    for (i, task) in tasks.iter().enumerate().skip(scroll.max(0) as usize).take(vis as usize) {
+        let top = rows_top + (i as i32 - scroll) * row_h;
+        if top + row_h > l.card.bottom {
+            break;
+        }
+        let rr = RECT { left: l.card.left, top, right: l.card.right, bottom: top + row_h };
 
         // 行背景
-        let row_bg = if Some(idx) == selected {
-            th.run_bg
+        let bg = if Some(i) == sel {
+            th.row_active
+        } else if task.status == Status::Running {
+            th.row_active
         } else {
-            match task.status {
-                Status::Error(_) => th.err_bg,
-                _ => th.card,
-            }
+            th.card
         };
-        let brush = CreateSolidBrush(row_bg);
-        FillRect(hdc, &row_rect, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
+        let b = CreateSolidBrush(bg);
+        FillRect(hdc, &rr, b);
+        let _ = DeleteObject(HGDIOBJ(b.0));
 
-        // 左侧状态色条
-        let bar = CreateSolidBrush(match task.status {
-            Status::Done(_) => th.ok,
-            Status::Error(_) => th.err,
-            Status::Running => th.accent,
-            Status::Wait => th.line,
-        });
-        FillRect(
-            hdc,
-            &RECT {
-                left: row_rect.left + 1,
-                top: row_rect.top,
-                right: row_rect.left + dpi::px(4),
-                bottom: row_rect.bottom,
-            },
-            bar,
-        );
-        let _ = DeleteObject(HGDIOBJ(bar.0));
+        let cy = top + row_h / 2;
 
-        // 图标
-        let icon_y = top + (row_h - icon_sz) / 2;
-        let mut icon_drawn = false;
-        let icon_entry: Option<Option<icons::IconEntry>> = UI.with(|s| {
-            let s = s.borrow();
-            match s.as_ref() {
-                Some(u) => {
-                    let u = u.borrow();
-                    let icons = u.icons.borrow();
-                    Some(icons.get(idx).cloned())
-                }
-                None => None,
-            }
-        }).flatten();
-        if let Some(Some(icons)) = icon_entry {
-            if let Some(hicon) = icons.hicon {
-                let _ = DrawIconEx(hdc, icon_x, icon_y, hicon, icon_sz, icon_sz, 0, None, DI_NORMAL);
-                icon_drawn = true;
-            }
-        }
-        if !icon_drawn {
-            draw_icon_placeholder(hdc, icon_x, icon_y, icon_sz, th.wait_bg);
-        }
-
-        let (name_font, small_font, badge_font) = UI.with(|s| {
-            let s = s.borrow();
-            match s.as_ref() {
-                Some(u) => {
-                    let u = u.borrow();
-                    (u.fonts.name, u.fonts.small, u.fonts.badge)
-                }
-                None => {
-                    let f = make_font(14, 400);
-                    (f, f, f)
-                }
-            }
-        });
+        // 扩展名徽章
+        let (fg, bgc, bd) = ext_style(th, &task.ext);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+        let tag = task.ext.to_uppercase();
+        let tw = draw_pill(hdc, &tag, name_x, cy, fg, bgc, ui.fonts.tag, bd);
+        let _ = SelectObject(hdc, old);
 
         // 文件名
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(name_font.0));
-        draw_text(
-            hdc, &task.name,
-            text_left, top + dpi::px(7),
-            name_w, dpi::px(20),
-            th.text, DRAW_TEXT_FORMAT(DT_LEFT.0), true,
-        );
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
+        draw_text(hdc, &task.name, name_x + tw + dpi::px(10), top + dpi::px(11),
+            name_w - tw - dpi::px(20), dpi::px(19), th.slate_700,
+            DRAW_TEXT_FORMAT(DT_LEFT.0), true);
         let _ = SelectObject(hdc, old);
-
-        // 副标题
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(small_font.0));
-        let sub = match &task.status {
-            Status::Done(_) => format!("已转换 · {}", crate::state::fmt_size(task.out_size)),
-            Status::Error(e) => e.clone(),
-            Status::Running => "转换中…".to_string(),
-            Status::Wait => format!("{} · 待转换", task.ext.to_uppercase()),
-        };
-        let sub_color = match task.status {
-            Status::Done(_) => th.ok,
-            Status::Error(_) => th.err,
-            _ => th.text_mute,
-        };
-        draw_text(
-            hdc, &sub,
-            text_left, top + dpi::px(28),
-            name_w, dpi::px(18),
-            sub_color, DRAW_TEXT_FORMAT(DT_LEFT.0), true,
-        );
 
         // 大小
-        draw_text(
-            hdc, &crate::state::fmt_size(task.size),
-            size_x, top + (row_h - dpi::px(18)) / 2,
-            size_w, dpi::px(18),
-            th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), true,
-        );
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+        draw_text(hdc, &crate::state::fmt_size(task.size),
+            size_r - dpi::px(60), cy - dpi::px(10), dpi::px(60), dpi::px(20),
+            th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
         let _ = SelectObject(hdc, old);
 
-        // 状态徽章
-        let (text, fg, bgc) = status_style(&th, &task.status);
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(badge_font.0));
-        draw_badge(
-            hdc, &text,
-            badge_x, top + row_h / 2,
-            fg, bgc, badge_font,
-        );
+        // 状态
+        match &task.status {
+            Status::Running => {
+                // 进行中：文字 + 进度条（不确定态，用流动条表示）
+                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+                draw_text(hdc, "正在转换…", status_x, cy - dpi::px(16),
+                    status_w - dpi::px(60), dpi::px(18), th.blue,
+                    DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+                let _ = SelectObject(hdc, old);
+                let bar = RECT {
+                    left: status_x,
+                    top: cy + dpi::px(2),
+                    right: status_x + status_w - dpi::px(70),
+                    bottom: cy + dpi::px(8),
+                };
+                let tb = CreateSolidBrush(th.slate_100);
+                FillRect(hdc, &bar, tb);
+                let _ = DeleteObject(HGDIOBJ(tb.0));
+                // 60% 流动进度
+                let pw = (bar.right - bar.left) * 60 / 100;
+                let pb = CreateSolidBrush(th.blue);
+                FillRect(hdc, &RECT { left: bar.left, top: bar.top, right: bar.left + pw, bottom: bar.bottom }, pb);
+                let _ = DeleteObject(HGDIOBJ(pb.0));
+            }
+            Status::Done(_) | Status::Error(_) | Status::Wait => {
+                let (text, fg, bgc, _) = status_style(th, &task.status);
+                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+                // 成功带 ✓
+                let prefix = if matches!(task.status, Status::Done(_)) { "✓ " } else { "" };
+                draw_text(hdc, &format!("{prefix}{text}"), status_x, cy - dpi::px(10),
+                    status_w - dpi::px(60), dpi::px(20),
+                    if matches!(task.status, Status::Wait) { th.text_mute } else { fg },
+                    DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+                let _ = SelectObject(hdc, old);
+            }
+        }
+
+        // 操作：打开文件夹 / 删除
+        let hot_open = ui.hot.get() == Some(HIT_ROW_OPEN + i as u32);
+        let hot_del = ui.hot.get() == Some(HIT_ROW_DEL + i as u32);
+        draw_folder_icon(hdc, l.card.right - dpi::px(50), cy - dpi::px(7), dpi::px(14),
+            if hot_open { th.blue } else { th.amber });
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn.0));
+        draw_text(hdc, "✕", l.card.right - dpi::px(32), cy - dpi::px(10), dpi::px(18), dpi::px(20),
+            if hot_del { th.red } else { th.slate_300 },
+            DRAW_TEXT_FORMAT(DT_CENTER.0), false);
         let _ = SelectObject(hdc, old);
 
         // 分隔线
-        hline(hdc, row_rect.left, row_rect.right, row_rect.bottom - 1, th.line_soft);
-
+        hline(hdc, rr.left + dpi::px(12), rr.right - dpi::px(12), rr.bottom - 1, th.border);
     }
 
-    // ── 滚动条（自绘，支持拖动）──
+    // 滚动条
     if tasks.len() > vis as usize {
-        let track_x = rect.right + dpi::px(3);
-        let track_w = dpi::px(10);
-        let track_h = rect.bottom - rect.top;
-
-        // 轨道
-        let tb = CreateSolidBrush(th.line_soft);
-        FillRect(
-            hdc,
-            &RECT {
-                left: track_x,
-                top: rect.top,
-                right: track_x + track_w,
-                bottom: rect.bottom,
-            },
-            tb,
-        );
+        let track_x = l.card.right - dpi::px(SCROLLBAR_W);
+        let track_h = l.card.bottom - l.card.top - dpi::px(THEAD_H);
+        let tb = CreateSolidBrush(th.track);
+        FillRect(hdc, &RECT { left: track_x, top: rows_top, right: l.card.right, bottom: rows_top + track_h }, tb);
         let _ = DeleteObject(HGDIOBJ(tb.0));
-
-        // 滑块
         let ratio = vis as f64 / tasks.len() as f64;
         let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(30))).min(track_h);
         let max_scroll = (tasks.len() as i32 - vis).max(1);
         let pos = (scroll as f64 / max_scroll as f64).clamp(0.0, 1.0);
-        let thumb_y = rect.top + ((pos * (track_h - thumb_h) as f64) as i32);
-
-        // 拖动时高亮
-        let dragging = UI.with(|slot| {
-            let slot = slot.borrow();
-            slot.as_ref().map(|u| u.borrow().dragging_scroll).unwrap_or(false)
-        });
-        let thumb_color = if dragging { th.accent } else { th.text_mute };
-        let thb = CreateSolidBrush(thumb_color);
-        FillRect(
-            hdc,
-            &RECT {
-                left: track_x,
-                top: thumb_y,
-                right: track_x + track_w,
-                bottom: thumb_y + thumb_h,
-            },
-            thb,
-        );
+        let thumb_y = rows_top + ((pos * (track_h - thumb_h) as f64) as i32);
+        let color = if ui.dragging_scroll.get() { th.blue } else { th.slate_400 };
+        let thb = CreateSolidBrush(color);
+        FillRect(hdc, &RECT { left: track_x + dpi::px(2), top: thumb_y, right: l.card.right - dpi::px(2), bottom: thumb_y + thumb_h }, thb);
         let _ = DeleteObject(HGDIOBJ(thb.0));
     }
+}
 
+/// ⑤ 底部栏
+unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
+    let th = &ui.theme;
+    let p = dpi::px(PAD);
+
+    // 白底 + 上边框
+    let card = CreateSolidBrush(th.card);
+    FillRect(hdc, &l.foot, card);
+    let _ = DeleteObject(HGDIOBJ(card.0));
+    hline(hdc, l.foot.left, l.foot.right, l.foot.top, th.border);
+
+    let fy = l.foot.top + dpi::px(20);
+
+    // 输出目录
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
+    draw_text(hdc, "输出目录:", p, fy - dpi::px(10), dpi::px(56), dpi::px(20),
+        th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    let od_x = p + dpi::px(58);
+    let od_w = dpi::px(230);
+    let hot_out = ui.hot.get() == Some(HIT_OUTDIR);
+    let od_rect = RECT { left: od_x, top: fy - dpi::px(13), right: od_x + od_w, bottom: fy + dpi::px(15) };
+    fill_round_rect(hdc, &od_rect, dpi::px(6), if hot_out { th.slate_200 } else { th.slate_100 });
+
+    let out_label = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .and_then(|u| u.borrow().state.out_dir.as_ref().map(|d| d.display().to_string()))
+            .unwrap_or_else(|| "与源文件同目录".to_string())
+    });
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+    draw_folder_icon(hdc, od_x + dpi::px(8), fy - dpi::px(5), dpi::px(13), th.text_mute);
+    draw_text(hdc, &out_label, od_x + dpi::px(26), fy - dpi::px(13), od_w - dpi::px(80), dpi::px(28),
+        th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+    // 「更改」
+    draw_text(hdc, "更改", od_rect.right - dpi::px(38), fy - dpi::px(13), dpi::px(32), dpi::px(28),
+        th.blue, DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    // 复选框
+    let cb_x = od_x + od_w + dpi::px(20);
+    let checked = ui.inject_frontmatter.get();
+    draw_checkbox(hdc, cb_x, fy, checked, th);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
+    draw_text(hdc, "注入 YAML Frontmatter", cb_x + dpi::px(22), fy - dpi::px(10), dpi::px(180), dpi::px(20),
+        th.slate_600, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
+
+    // 状态文字
+    let st = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.status.clone()).unwrap_or_default()
+    });
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
+    let stw = draw_text(hdc, &st, l.foot.right - p - dpi::px(150) - dpi::px(140), fy - dpi::px(10),
+        dpi::px(140), dpi::px(20), th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), true);
+    let _ = SelectObject(hdc, old);
+
+    // 开始转换按钮
+    let bw = dpi::px(132);
+    let bh = dpi::px(34);
+    let br = RECT {
+        left: l.foot.right - p - bw,
+        top: fy - dpi::px(16),
+        right: l.foot.right - p,
+        bottom: fy - dpi::px(16) + bh,
+    };
+    let running = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.running).unwrap_or(false)
+    });
+    let (bg, fg) = if running { (th.slate_300, th.card) } else { (th.blue, rgb(0xFF, 0xFF, 0xFF)) };
+    fill_round_rect(hdc, &br, dpi::px(8), bg);
+    draw_bolt_icon(hdc, br.left + dpi::px(22), (br.top + br.bottom) / 2, dpi::px(16), fg);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.big.0));
+    draw_text(hdc, if running { "转换中…" } else { "开始转换" },
+        br.left + dpi::px(40), br.top, bw - dpi::px(50), bh, fg,
+        DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    let _ = SelectObject(hdc, old);
 }
 
 // ── 交互 ──
-unsafe fn on_command(hwnd: HWND, id: i32) {
+unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
+    let x = (lp.0 & 0xFFFF) as i16 as i32;
+    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+    let l = compute_layout(hwnd);
+
+    // 滚动条拖动
+    if x >= l.card.right - dpi::px(SCROLLBAR_W) && x <= l.card.right {
+        UI.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(ui) = slot.as_ref() {
+                let mut u = ui.borrow_mut();
+                u.dragging_scroll.set(true);
+                u.scroll_anchor.set(y - u.scroll.get());
+                let _ = SetCapture(hwnd);
+            }
+        });
+        return;
+    }
+
+    // 命中检测
+    let hit = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .and_then(|ui| {
+                ui.borrow()
+                    .hits
+                    .borrow()
+                    .iter()
+                    .find(|h| {
+                        x >= h.rect.left && x < h.rect.right
+                            && y >= h.rect.top && y < h.rect.bottom
+                    })
+                    .map(|h| h.id)
+            })
+    });
+    let Some(id) = hit else { return };
+
     match id {
-        ID_BTN_FILES => {
+        HIT_ADD_FILES => {
             if let Some(paths) = crate::dialog::pick_files(hwnd) {
                 add_paths(hwnd, &paths, "");
             }
         }
-        ID_BTN_DIR => {
+        HIT_ADD_DIR => {
             if let Some(dir) = crate::dialog::pick_folder(hwnd) {
                 add_folder(hwnd, &dir);
             }
         }
-        ID_BTN_CLEAR => {
+        HIT_CLEAR => {
             UI.with(|slot| {
                 let slot = slot.borrow();
                 if let Some(ui) = slot.as_ref() {
                     let mut u = ui.borrow_mut();
                     u.state.clear();
                     u.icons.borrow_mut().clear();
+                    u.scroll.set(0);
+                    u.selected.set(None);
                 }
             });
             refresh_list(hwnd);
             update_status(hwnd);
         }
-        ID_BTN_CONVERT => {
-            UI.with(|slot| {
-                let slot = slot.borrow();
-                if let Some(ui) = slot.as_ref() {
-                    let mut u = ui.borrow_mut();
-                    if u.state.running || u.state.tasks.is_empty() {
-                        return;
-                    }
-                    for t in u.state.tasks.iter_mut() {
-                        t.status = Status::Wait;
-                        t.out_size = 0;
-                    }
-                    u.state.running = true;
-                    u.state.stats = Default::default();
-                    u.state.stats.total = u.state.tasks.len();
-                    let tasks = u.state.tasks.clone();
-                    let out = u.state.out_dir.clone();
-                    let rx = worker::spawn(tasks, out);
-                    *u.rx.borrow_mut() = Some(rx);
-                }
-            });
-            refresh_list(hwnd);
-            update_status(hwnd);
-        }
-        ID_BTN_OUT => {
+        HIT_OUTDIR => {
             if let Some(dir) = crate::dialog::pick_folder(hwnd) {
                 UI.with(|slot| {
                     let slot = slot.borrow();
@@ -985,14 +997,202 @@ unsafe fn on_command(hwnd: HWND, id: i32) {
                         let mut u = ui.borrow_mut();
                         u.state.out_dir = Some(dir.clone());
                         u.state.out_confirmed = true;
-                        u.state.status = format!("输出到 {}", dir.display());
                     }
                 });
                 update_status(hwnd);
             }
         }
+        HIT_FRONT => {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let mut u = ui.borrow_mut();
+                    u.inject_frontmatter.set(!u.inject_frontmatter.get());
+                }
+            });
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        HIT_CONVERT => {
+            start_convert(hwnd);
+        }
+        id if id >= HIT_ROW_DEL && id < HIT_ROW_DEL + 1000 => {
+            let idx = (id - HIT_ROW_DEL) as usize;
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let mut u = ui.borrow_mut();
+                    if idx < u.state.tasks.len() {
+                        u.state.tasks.remove(idx);
+                        u.state.recount();
+                        u.selected.set(None);
+                    }
+                }
+            });
+            load_icons();
+            refresh_list(hwnd);
+            update_status(hwnd);
+        }
+        id if id >= HIT_ROW_OPEN && id < HIT_ROW_OPEN + 1000 => {
+            let idx = (id - HIT_ROW_OPEN) as usize;
+            let path = UI.with(|slot| {
+                let slot = slot.borrow();
+                slot.as_ref()
+                    .and_then(|u| u.borrow().state.tasks.get(idx).map(|t| t.path.clone()))
+            });
+            if let Some(p) = path {
+                reveal_in_folder(&p);
+            }
+        }
         _ => {}
     }
+}
+
+unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) {
+    let x = (lp.0 & 0xFFFF) as i16 as i32;
+    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+    let dragging = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().dragging_scroll.get()).unwrap_or(false)
+    });
+
+    if dragging {
+        let l = compute_layout(hwnd);
+        let rows_top = l.card.top + dpi::px(THEAD_H);
+        let track_h = l.card.bottom - rows_top;
+        let vis = visible_rows(hwnd);
+        let count = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+        }) as i32;
+        if count > vis && track_h > 0 {
+            let ratio = vis as f64 / count as f64;
+            let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(30))).min(track_h);
+            let max_scroll = count - vis;
+            let travel = (track_h - thumb_h).max(1);
+            let anchor = UI.with(|slot| {
+                let slot = slot.borrow();
+                slot.as_ref().map(|u| u.borrow().scroll_anchor.get()).unwrap_or(0)
+            });
+            let ratio_pos = (y - anchor) as f64 / travel as f64;
+            let new_scroll = ((ratio_pos * max_scroll as f64).round() as i32).clamp(0, max_scroll);
+            set_scroll(hwnd, new_scroll);
+        }
+        return;
+    }
+
+    // hover 检测
+    let hot = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().and_then(|ui| {
+            ui.borrow()
+                .hits
+                .borrow()
+                .iter()
+                .find(|h| x >= h.rect.left && x < h.rect.right && y >= h.rect.top && y < h.rect.bottom)
+                .map(|h| h.id)
+        })
+    });
+    let changed = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|ui| {
+            let mut u = ui.borrow_mut();
+            if u.hot.get() != hot {
+                u.hot.set(hot);
+                true
+            } else {
+                false
+            }
+        })
+    });
+    if changed == Some(true) {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+unsafe fn on_key(hwnd: HWND, key: u32) {
+    let count = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+    });
+    if count == 0 {
+        return;
+    }
+    match key {
+        0x26 => { // 上
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let mut u = ui.borrow_mut();
+                    let cur = u.selected.get().unwrap_or(0);
+                    u.selected.set(Some(cur.saturating_sub(1)));
+                    ensure_visible(hwnd, u.scroll.get());
+                }
+            });
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        0x28 => { // 下
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let mut u = ui.borrow_mut();
+                    let cur = u.selected.get().unwrap_or(0);
+                    u.selected.set(Some((cur + 1).min(count - 1)));
+                    ensure_visible(hwnd, u.scroll.get());
+                }
+            });
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        0x2E => { // Delete
+            let sel = UI.with(|slot| {
+                let slot = slot.borrow();
+                slot.as_ref().and_then(|u| u.borrow().selected.get())
+            });
+            if let Some(idx) = sel {
+                UI.with(|slot| {
+                    let slot = slot.borrow();
+                    if let Some(ui) = slot.as_ref() {
+                        let mut u = ui.borrow_mut();
+                        if idx < u.state.tasks.len() {
+                            u.state.tasks.remove(idx);
+                            u.state.recount();
+                            u.selected.set(None);
+                        }
+                    }
+                });
+                load_icons();
+                refresh_list(hwnd);
+                update_status(hwnd);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── 转换 ──
+unsafe fn start_convert(hwnd: HWND) {
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        let Some(ui) = slot.as_ref() else { return };
+        let mut u = ui.borrow_mut();
+        if u.state.running || u.state.tasks.is_empty() {
+            return;
+        }
+        for t in u.state.tasks.iter_mut() {
+            t.status = Status::Wait;
+            t.out_size = 0;
+        }
+        u.state.running = true;
+        u.state.stats = Default::default();
+        u.state.stats.total = u.state.tasks.len();
+        let tasks = u.state.tasks.clone();
+        let out = u.state.out_dir.clone();
+        let inject = u.inject_frontmatter.get();
+        let rx = worker::spawn(tasks, out, inject);
+        *u.rx.borrow_mut() = Some(rx);
+    });
+    refresh_list(hwnd);
+    update_status(hwnd);
 }
 
 unsafe fn on_drop(hwnd: HWND, lp: LPARAM) {
@@ -1011,7 +1211,6 @@ unsafe fn on_drop(hwnd: HWND, lp: LPARAM) {
         }
     }
     let _ = DragFinish(hd);
-
     for p in paths {
         if p.is_dir() {
             add_folder(hwnd, &p);
@@ -1056,11 +1255,7 @@ unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
                 .filter(|e| e.file_type().is_file())
             {
                 let path = entry.path().to_path_buf();
-                let ext = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
                 if !crate::state::is_supported(&ext) {
                     continue;
                 }
@@ -1069,11 +1264,7 @@ unsafe fn add_folder(hwnd: HWND, dir: &PathBuf) {
                     .and_then(|p| p.strip_prefix(&base).ok())
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_default();
-                let rel = if rel.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", rel)
-                };
+                let rel = if rel.is_empty() { String::new() } else { format!("{}/", rel) };
                 if u.state.add_file(path, rel) {
                     added += 1;
                 }
@@ -1092,330 +1283,67 @@ fn load_icons() {
         let Some(ui) = slot.as_ref() else { return };
         let tasks: Vec<Task> = ui.borrow().state.tasks.clone();
         let mut guard = ui.borrow_mut();
-        // 释放旧图标
         for ic in guard.icons.borrow().iter().flatten() {
             icons::destroy(ic);
         }
-        let mut icons = guard.icons.borrow_mut();
-        icons.clear();
+        let mut list = guard.icons.borrow_mut();
+        list.clear();
         for t in tasks {
-            icons.push(icons::load(&t.path, &t.ext));
+            list.push(icons::load(&t.path, &t.ext));
         }
     });
 }
 
 pub unsafe fn refresh_list(hwnd: HWND) {
-    // 自绘列表：只需重绘
     UI.with(|slot| {
         let slot = slot.borrow();
         if let Some(ui) = slot.as_ref() {
             let mut u = ui.borrow_mut();
-            // 滚动位置回正（列表变短时）
             let vis = visible_rows(hwnd);
             let max_scroll = (u.state.tasks.len() as i32 - vis).max(0);
-            if u.scroll > max_scroll {
-                u.scroll = max_scroll;
+            if u.scroll.get() > max_scroll {
+                u.scroll.set(max_scroll);
             }
-            if u.selected.map(|s| s >= u.state.tasks.len()).unwrap_or(false) {
-                u.selected = None;
+            if u.selected.get().map(|s| s >= u.state.tasks.len()).unwrap_or(false) {
+                u.selected.set(None);
             }
         }
     });
-    sync_scrollbar(hwnd);
+    layout(hwnd);
     let _ = InvalidateRect(hwnd, None, true);
 }
 
-/// 鼠标点击：选中行
-unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
-    let x = (lp.0 & 0xFFFF) as i16 as i32;
-    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-    let rect = list_rect(hwnd);
-
-    if x < rect.left || x > rect.right || y < rect.top || y > rect.bottom {
-        return;
-    }
-
-    // 点在滚动条上 → 开始拖动
-    if x >= rect.right && x <= rect.right + dpi::px(16) {
-        UI.with(|slot| {
-            let slot = slot.borrow();
-            if let Some(ui) = slot.as_ref() {
-                let mut u = ui.borrow_mut();
-                u.dragging_scroll = true;
-                u.scroll_anchor = y - u.scroll;
-                let _ = SetCapture(hwnd);
-            }
-        });
-        return;
-    }
-
-    let row_h = dpi::px(ROW_H);
-    let idx = (y - rect.top) / row_h + scroll_offset(hwnd);
-    let count = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
-    });
-
-    if idx >= 0 && (idx as usize) < count {
-        UI.with(|slot| {
-            let slot = slot.borrow();
-            if let Some(ui) = slot.as_ref() {
-                let mut u = ui.borrow_mut();
-                u.selected = Some(idx as usize);
-            }
-        });
-        let _ = InvalidateRect(hwnd, None, false);
-    }
-}
-
-/// 最大可滚动行数
-fn max_scroll(hwnd: HWND) -> i32 {
-    let count = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
-    }) as i32;
-    (count - visible_rows(hwnd)).max(0)
-}
-
-/// 读当前滚动位置
-fn get_scroll(hwnd: HWND) -> i32 {
-    UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().scroll).unwrap_or(0)
-    })
-}
-
-/// 设置滚动位置并刷新界面
-unsafe fn set_scroll(hwnd: HWND, pos: i32) {
-    let max = max_scroll(hwnd);
-    let pos = pos.max(0).min(max);
-    UI.with(|slot| {
-        let slot = slot.borrow();
-        if let Some(ui) = slot.as_ref() {
-            ui.borrow_mut().scroll = pos;
-        }
-    });
-    sync_scrollbar(hwnd);
-    let _ = InvalidateRect(hwnd, None, false);
-}
-
-/// 把滚动位置同步到系统滚动条控件
-fn sync_scrollbar(hwnd: HWND) {
-    unsafe {
-        let Ok(sb) = GetDlgItem(hwnd, ID_SCROLL) else { return };
-        let count = UI.with(|slot| {
-            let slot = slot.borrow();
-            slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
-        }) as i32;
-        let vis = visible_rows(hwnd);
-        let scroll = get_scroll(hwnd);
-
-        let si = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_RANGE | SIF_POS | SIF_PAGE,
-            nMin: 0,
-            // nMax 是「可滚动到的最大位置」
-            nMax: (count - vis).max(0),
-            nPage: vis as u32,
-            nPos: scroll,
-            nTrackPos: scroll,
-        };
-        SetScrollInfo(sb, SCROLLBAR_CONSTANTS(3), &si as *const SCROLLINFO, true);
-    }
-}
-
-/// 当前滚动偏移
-fn scroll_offset(hwnd: HWND) -> i32 {
-    let _ = hwnd;
-    UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().scroll).unwrap_or(0)
-    })
-}
-
-/// 鼠标移动：拖动滚动条
-unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) {
-    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-
-    let dragging = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().dragging_scroll).unwrap_or(false)
-    });
-    if !dragging {
-        return;
-    }
-
-    let rect = list_rect(hwnd);
-    let track_h = rect.bottom - rect.top;
-    let vis = visible_rows(hwnd);
-    let count = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
-    }) as i32;
-
-    if count <= vis {
-        return;
-    }
-
-    let ratio = vis as f64 / count as f64;
-    let thumb_h = ((ratio * track_h as f64) as i32).max(dpi::px(28));
-    let max_scroll = count - vis;
-    let travel = (track_h - thumb_h).max(1);
-
-    let anchor = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().scroll_anchor).unwrap_or(0)
-    });
-
-    // 滑块跟随鼠标
-    let thumb_y = y - anchor;
-    let ratio_pos = thumb_y as f64 / travel as f64;
-    let new_scroll = ((ratio_pos * max_scroll as f64).round() as i32)
-        .clamp(0, max_scroll);
-
-    set_scroll(hwnd, new_scroll);
-}
-
-/// 键盘：上下移动选中 / Delete 删除
-unsafe fn on_key(hwnd: HWND, key: u32) {
-    let count = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
-    });
-    if count == 0 {
-        return;
-    }
-
-    match key {
-        0x26 => {
-            // 上箭头
-            UI.with(|slot| {
-                let slot = slot.borrow();
-                if let Some(ui) = slot.as_ref() {
-                    let mut u = ui.borrow_mut();
-                    let cur = u.selected.unwrap_or(0);
-                    u.selected = Some(cur.saturating_sub(1));
-                    ensure_visible(hwnd, u.scroll);
-                }
-            });
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        0x28 => {
-            // 下箭头
-            UI.with(|slot| {
-                let slot = slot.borrow();
-                if let Some(ui) = slot.as_ref() {
-                    let mut u = ui.borrow_mut();
-                    let cur = u.selected.unwrap_or(0);
-                    u.selected = Some((cur + 1).min(count - 1));
-                    ensure_visible(hwnd, u.scroll);
-                }
-            });
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        0x2E => {
-            // Delete
-            let sel = UI.with(|slot| {
-                let slot = slot.borrow();
-                slot.as_ref().map(|u| u.borrow().selected).unwrap_or(None)
-            });
-            if let Some(idx) = sel {
-                UI.with(|slot| {
-                    let slot = slot.borrow();
-                    if let Some(ui) = slot.as_ref() {
-                        let mut u = ui.borrow_mut();
-                        if idx < u.state.tasks.len() {
-                            u.state.tasks.remove(idx);
-                            u.state.recount();
-                            u.selected = None;
-                        }
-                    }
-                });
-                load_icons();
-                refresh_list(hwnd);
-                update_status(hwnd);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 确保选中项在可视区内
-fn ensure_visible(hwnd: HWND, scroll: i32) {
-    let vis = visible_rows(hwnd);
-    let sel = UI.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref().map(|u| u.borrow().selected).unwrap_or(None)
-    });
-    let Some(sel) = sel else { return };
-    let s = sel as i32;
-    let new_scroll = if s < scroll {
-        s
-    } else if s >= scroll + vis {
-        s - vis + 1
-    } else {
-        scroll
-    };
-    UI.with(|slot| {
-        let slot = slot.borrow();
-        if let Some(ui) = slot.as_ref() {
-            ui.borrow_mut().scroll = new_scroll;
-        }
-    });
-}
-
 pub unsafe fn update_status(hwnd: HWND) {
-    UI.with(|slot| {
+    let text = UI.with(|slot| {
         let slot = slot.borrow();
-        let Some(ui) = slot.as_ref() else { return };
-        let ui = ui.borrow();
-        let st = &ui.state;
-
-        let text = if st.running {
+        let Some(ui) = slot.as_ref() else { return String::new() };
+        let u = ui.borrow();
+        if u.state.running {
+            let s = &u.state.stats;
             format!(
-                "正在转换 {}/{}（{} 个进行中）",
-                st.stats.settled(),
-                st.stats.total,
-                st.stats.running
+                "正在转换 ({}/{}) · 总进度 {}%",
+                s.settled(),
+                s.total,
+                s.percent()
             )
         } else {
-            st.status.clone()
-        };
-
-        if let Ok(c) = GetDlgItem(hwnd, ID_STATIC_STATUS) {
-            let _ = SetWindowTextW(c, &windows::core::HSTRING::from(text));
-        }
-        if let Ok(c) = GetDlgItem(hwnd, ID_STATIC_PCT) {
-            let _ = SetWindowTextW(
-                c,
-                &windows::core::HSTRING::from(format!("{}%", st.stats.percent())),
-            );
-        }
-        if let Ok(pb) = GetDlgItem(hwnd, ID_PROGRESS) {
-            SendMessageW(
-                pb,
-                PBM_SETPOS,
-                WPARAM(st.stats.percent() as usize),
-                LPARAM(0),
-            );
-        }
-
-        if let Ok(b) = GetDlgItem(hwnd, ID_BTN_CONVERT) {
-            let label = if st.running { "转换中…" } else { "开始转换" };
-            let _ = SetWindowTextW(b, &windows::core::HSTRING::from(label));
-            let _ = EnableWindow(b, !st.running && !st.tasks.is_empty());
-        }
-        if let Ok(b) = GetDlgItem(hwnd, ID_BTN_CLEAR) {
-            let _ = EnableWindow(b, !st.running);
-        }
-        if let Ok(b) = GetDlgItem(hwnd, ID_BTN_OUT) {
-            let label = match &st.out_dir {
-                Some(d) => format!("输出: {}", d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
-                None => "输出目录".to_string(),
-            };
-            let _ = SetWindowTextW(b, &windows::core::HSTRING::from(label));
+            u.state.status.clone()
         }
     });
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(ui) = slot.as_ref() {
+            ui.borrow_mut().state.status = text;
+        }
+    });
+    if let Ok(pb) = GetDlgItem(hwnd, 106) {
+        let pct = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|u| u.borrow().state.stats.percent()).unwrap_or(0)
+        });
+        SendMessageW(pb, PBM_SETPOS, WPARAM(pct as usize), LPARAM(0));
+    }
+    let _ = InvalidateRect(hwnd, None, false);
 }
 
 unsafe fn tick(hwnd: HWND) {
@@ -1449,7 +1377,6 @@ unsafe fn tick(hwnd: HWND) {
                 if let Some(t) = u.state.tasks.iter_mut().find(|t| t.id == id) {
                     match result {
                         Ok((size, _)) => {
-                            // 注意：Status::Done 存的是耗时(毫秒)，字节数放 out_size
                             t.status = Status::Done(elapsed_ms);
                             t.out_size = size;
                         }
@@ -1458,24 +1385,94 @@ unsafe fn tick(hwnd: HWND) {
                 }
             }
             u.state.recount();
-            if all_done
-                || (u.state.stats.total > 0 && u.state.stats.settled() == u.state.stats.total)
-            {
+            if all_done || (u.state.stats.total > 0 && u.state.stats.settled() == u.state.stats.total) {
                 u.state.running = false;
                 let s = u.state.stats.clone();
-                let out = u
-                    .state
-                    .out_dir
-                    .as_ref()
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_else(|| "源文件同目录".to_string());
-                u.state.status = format!("{} 成功 · {} 失败 · 输出到 {}", s.done, s.failed, out);
+                u.state.status = format!("{} 成功 · {} 失败", s.done, s.failed);
             }
         }
     });
 
     refresh_list(hwnd);
     update_status(hwnd);
+}
+
+// ── 滚动辅助 ──
+fn get_scroll() -> i32 {
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().scroll.get()).unwrap_or(0)
+    })
+}
+
+fn set_scroll(hwnd: HWND, pos: i32) {
+    let max = max_scroll(hwnd);
+    let pos = pos.max(0).min(max);
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(ui) = slot.as_ref() {
+            ui.borrow_mut().scroll.set(pos);
+        }
+    });
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+fn max_scroll(hwnd: HWND) -> i32 {
+    let count = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+    }) as i32;
+    (count - visible_rows(hwnd)).max(0)
+}
+
+fn visible_rows(hwnd: HWND) -> i32 {
+    let l = compute_layout(hwnd);
+    let rows_h = l.card.bottom - (l.card.top + dpi::px(THEAD_H));
+    (rows_h / dpi::px(ROW_H)).max(1)
+}
+
+fn ensure_visible(hwnd: HWND, scroll: i32) {
+    let vis = visible_rows(hwnd);
+    let sel = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().and_then(|u| u.borrow().selected.get())
+    });
+    let Some(sel) = sel else { return };
+    let s = sel as i32;
+    let new_scroll = if s < scroll {
+        s
+    } else if s >= scroll + vis {
+        s - vis + 1
+    } else {
+        scroll
+    };
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(ui) = slot.as_ref() {
+            ui.borrow_mut().scroll.set(new_scroll);
+        }
+    });
+}
+
+/// 在文件管理器中定位文件
+unsafe fn reveal_in_folder(path: &std::path::Path) {
+    let wide = to_wide(&path.display().to_string());
+    let verb = to_wide("explore");
+    let file = to_wide(&path.display().to_string());
+    ShellExecuteW(
+        HWND(std::ptr::null_mut()),
+        PCWSTR(verb.as_ptr()),
+        PCWSTR(file.as_ptr()),
+        PCWSTR(std::ptr::null()),
+        PCWSTR(std::ptr::null()),
+        SW_SHOWNORMAL,
+    );
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 刷新主题（跟随系统深色模式）
@@ -1488,7 +1485,6 @@ unsafe fn refresh_theme(hwnd: HWND) -> bool {
             u.theme = if dark { Theme::dark() } else { Theme::light() };
         }
     });
-    // 标题栏跟随
     let flag = i32::from(dark);
     let _ = DwmSetWindowAttribute(
         hwnd,
@@ -1500,7 +1496,7 @@ unsafe fn refresh_theme(hwnd: HWND) -> bool {
     true
 }
 
-/// 检测系统是否为深色模式（读注册表 AppsUseLightTheme）
+/// 检测系统是否为深色模式
 pub unsafe fn is_dark_mode() -> bool {
     use windows::Win32::System::Registry::*;
     let mut key = HKEY::default();
@@ -1534,17 +1530,14 @@ pub unsafe fn is_dark_mode() -> bool {
     value == 0
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
-
-/// 预加载文件（测试 / 便捷启动用）
+/// 预加载文件（--gui 参数用）
 pub unsafe fn preload_files(hwnd: HWND, paths: &[PathBuf]) {
     add_paths(hwnd, paths, "");
 }
 
-/// 预加载目录（测试 / 便捷启动用）
+/// 预加载目录（--gui 参数用）
 pub unsafe fn preload_folder(hwnd: HWND, dir: &PathBuf) {
     add_folder(hwnd, dir);
 }
+

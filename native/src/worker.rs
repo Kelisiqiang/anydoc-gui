@@ -35,7 +35,11 @@ fn convert_one(path: &PathBuf) -> Result<(u64, String), String> {
 /// 启动转换。
 ///
 /// 返回接收端，主线程应周期性 try_recv 取结果。
-pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg> {
+pub fn spawn(
+    tasks: Vec<Task>,
+    out_root: Option<PathBuf>,
+    inject_frontmatter: bool,
+) -> Receiver<WorkerMsg> {
     let out_root: Arc<Option<PathBuf>> = Arc::new(out_root);
     let (tx, rx) = channel::<WorkerMsg>();
 
@@ -56,6 +60,7 @@ pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg>
         let tx = tx.clone();
         let done_count = done_count.clone();
         let out_root = out_root.clone();
+        let inject_frontmatter = inject_frontmatter;
 
         thread::spawn(move || {
             loop {
@@ -91,6 +96,13 @@ pub fn spawn(tasks: Vec<Task>, out_root: Option<PathBuf>) -> Receiver<WorkerMsg>
                 let t_start = std::time::Instant::now();
                 let result = match convert_one(&task.path) {
                     Ok((size, md)) => {
+                        // 可选：注入 YAML Frontmatter
+                        let md = if inject_frontmatter {
+                            crate::frontmatter::inject(&task, &md)
+                        } else {
+                            md
+                        };
+                        let size = md.len() as u64;
                         // 输出路径（含 rel 与同目录判定）
                         let out_path = task.output_path(&out_root);
                         // 父目录可能不存在（选目录时的子目录结构）
