@@ -256,6 +256,7 @@ pub fn fill_circle(hdc: HDC, cx: i32, cy: i32, radius: i32, color: COLORREF) {
     }
 }
 
+
 /// 绘制单行文本
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text(
@@ -445,22 +446,6 @@ pub fn draw_folder_icon(hdc: HDC, x: i32, cy: i32, size: i32, color: COLORREF) {
     }
 }
 
-/// 闪电图标（开始转换按钮）
-pub fn draw_bolt_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
-    unsafe {
-        let pen = CreatePen(PS_SOLID, dpi::px(2), color);
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
-        let s = size;
-        MoveToEx(hdc, cx + s / 5, cy - s / 2, None);
-        LineTo(hdc, cx - s / 3, cy + s / 6);
-        LineTo(hdc, cx, cy + s / 6);
-        LineTo(hdc, cx - s / 5, cy + s / 2);
-        LineTo(hdc, cx + s / 3, cy - s / 6);
-        LineTo(hdc, cx - s / 6, cy - s / 6);
-        let _ = SelectObject(hdc, old);
-        let _ = DeleteObject(HGDIOBJ(pen.0));
-    }
-}
 
 /// 加号图标
 pub fn draw_plus_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {

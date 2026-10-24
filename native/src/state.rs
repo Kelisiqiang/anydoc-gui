@@ -42,6 +42,14 @@ pub struct Task {
     pub status: Status,
     /// 转换后 Markdown 大小
     pub out_size: u64,
+    /// 当前进度 0-100（仅进行中有意义）
+    pub progress: u8,
+    /// 当前阶段文字（如「读取文件」）
+    pub phase: String,
+    /// 输出的 .md 完整路径（转换成功后有值，用于「打开所在文件夹」）
+    pub out_path: Option<PathBuf>,
+    /// 取消标志（与后台线程共享，点 ✕ 时置位，worker 各阶段检查）
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Task {
@@ -67,7 +75,23 @@ impl Task {
             size,
             status: Status::Wait,
             out_size: 0,
+            progress: 0,
+            phase: String::new(),
+            out_path: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 是否已被用户取消
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 请求取消（点 ✕ 时调用，后台线程会在下一个阶段边界停下）
+    pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 输出文件路径
@@ -124,6 +148,18 @@ impl Stats {
 /// 后台线程回传的消息
 #[derive(Debug)]
 pub enum WorkerMsg {
+    /// 某个任务开始处理（把状态从「等待」切到「转换中」）
+    Started {
+        id: usize,
+    },
+    /// 某个任务的进度更新
+    Progress {
+        id: usize,
+        /// 0-100
+        percent: u8,
+        /// 阶段文字
+        phase: String,
+    },
     /// 某个任务完成
     Finished {
         id: usize,

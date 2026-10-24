@@ -5,7 +5,16 @@
 //   - 结果通过 mpsc channel 回传，主线程用 SetTimer 轮询收取
 //     （Windows 控件非线程安全，所有 UI 操作必须回主线程）
 //   - 并发数 = CPU 核数 - 1，上限 4
+//
+// 进度：
+//   官方 anydoc 的 to_markdown 是一次性同步调用，没有进度回调。
+//   所以这里自己接管 IO，把一次转换拆成三个可观测阶段：
+//     ① 读取文件  0%→30%   真实字节进度（分块读）
+//     ② 解析转换  30%→95%  不可知，用不确定态动画 + 阶段文字
+//     ③ 写入文件  95%→100% 真实字节进度（分块写）
+//   每个任务独立一条进度条，互不影响。
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -13,10 +22,116 @@ use std::thread;
 
 use crate::state::{Task, WorkerMsg};
 
-/// 转换一个文件：返回 (md 字节数, markdown 内容) 或错误原因
-fn convert_one(path: &PathBuf) -> Result<(u64, String), String> {
-    // 官方内核：字节签名识别格式，改过扩展名的文件也能正确解析
-    let md = anydoc::to_markdown(path).map_err(|e| {
+/// 阶段划分（百分比）
+const READ_END: u8 = 30;
+const PARSE_END: u8 = 95;
+
+/// 读取阶段的分块大小
+const CHUNK: usize = 256 * 1024;
+
+/// 任务被取消
+const CANCELLED: &str = "已取消";
+
+/// 分阶段读取文件，回传真实字节进度
+fn read_with_progress(
+    path: &PathBuf,
+    total_hint: u64,
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+    task: &Task,
+) -> Result<Vec<u8>, String> {
+    let id = task.id;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("读取失败: {}", e))?;
+    let mut buf = Vec::with_capacity(total_hint as usize);
+    let mut chunk = vec![0u8; CHUNK];
+    let mut read_total: u64 = 0;
+
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("读取失败: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        read_total += n as u64;
+
+        if task.is_cancelled() {
+            return Err(CANCELLED.to_string());
+        }
+
+        // 真实字节进度：映射到 0%→30%
+        let pct = if total_hint > 0 {
+            ((read_total as f64 / total_hint as f64) * READ_END as f64) as u8
+        } else {
+            0
+        };
+        let _ = tx.send(WorkerMsg::Progress {
+            id,
+            percent: pct.min(READ_END),
+            phase: "读取文件".to_string(),
+        });
+    }
+
+    let _ = tx.send(WorkerMsg::Progress {
+        id,
+        percent: READ_END,
+        phase: "解析转换".to_string(),
+    });
+    Ok(buf)
+}
+
+/// 分阶段写入文件，回传真实字节进度
+fn write_with_progress(
+    path: &PathBuf,
+    data: &[u8],
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+    task: &Task,
+) -> Result<(), String> {
+    let id = task.id;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| format!("写入失败: {}", e))?;
+    let total = data.len() as u64;
+    let mut written: u64 = 0;
+
+    for chunk in data.chunks(CHUNK) {
+        file.write_all(chunk).map_err(|e| format!("写入失败: {}", e))?;
+        written += chunk.len() as u64;
+
+        if task.is_cancelled() {
+            // 取消：删掉半成品，不留垃圾文件
+            let _ = std::fs::remove_file(path);
+            return Err(CANCELLED.to_string());
+        }
+        let pct = if total > 0 {
+            (PARSE_END as u64
+                + ((written as f64 / total as f64) * (100 - PARSE_END) as f64) as u64)
+                as u8
+        } else {
+            100
+        };
+        let _ = tx.send(WorkerMsg::Progress {
+            id,
+            percent: pct.min(100),
+            phase: "写入文件".to_string(),
+        });
+    }
+
+    let _ = file.flush();
+    Ok(())
+}
+
+/// 调用官方内核转换
+fn parse_bytes(
+    task: &Task,
+    bytes: &[u8],
+) -> Result<String, String> {
+    // 字节签名识别格式，改过扩展名的文件也能正确解析
+    let format = anydoc::Format::from_bytes(bytes)
+        .or_else(|| anydoc::Format::from_extension(&task.ext));
+
+    let md = anydoc::to_markdown_bytes(bytes, format).map_err(|e| {
         // 把内部错误码翻译成用户能懂的话
         match e {
             anydoc::ConvertError::NeedsOcr { .. } => "需 OCR（anydoc 不含 OCR）".to_string(),
@@ -29,7 +144,7 @@ fn convert_one(path: &PathBuf) -> Result<(u64, String), String> {
             other => format!("转换失败: {}", other),
         }
     })?;
-    Ok((md.len() as u64, md))
+    Ok(md)
 }
 
 /// 启动转换。
@@ -49,10 +164,8 @@ pub fn spawn(
         .clamp(2, 4);
 
     // 简单工作窃取：所有线程共享一个任务队列
-    let queue = std::sync::Arc::new(std::sync::Mutex::new(
-        tasks.into_iter().collect::<Vec<_>>(),
-    ));
-    let done_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(std::sync::Mutex::new(tasks.into_iter().collect::<Vec<_>>()));
+    let done_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let total = queue.lock().map(|q| q.len()).unwrap_or(0);
 
     for _ in 0..threads {
@@ -92,40 +205,21 @@ pub fn spawn(
                         .unwrap_or_else(|| PathBuf::from(".")),
                 };
 
-                // 转换 + 写盘
+                // 通知主线程：这个任务开始处理了
+                let _ = tx.send(WorkerMsg::Started { id: task.id });
+
                 let t_start = std::time::Instant::now();
-                let result = match convert_one(&task.path) {
-                    Ok((size, md)) => {
-                        // 可选：注入 YAML Frontmatter
-                        let md = if inject_frontmatter {
-                            crate::frontmatter::inject(&task, &md)
-                        } else {
-                            md
-                        };
-                        let size = md.len() as u64;
-                        // 输出路径（含 rel 与同目录判定）
-                        let out_path = task.output_path(&out_root);
-                        // 父目录可能不存在（选目录时的子目录结构）
-                        if let Some(parent) = out_path.parent() {
-                            if let Err(e) = std::fs::create_dir_all(parent) {
-                                let _ = tx.send(WorkerMsg::Finished {
-                                    id: task.id,
-                                    elapsed_ms: t_start.elapsed().as_millis() as u64,
-                                    result: Err(format!("创建目录失败: {}", e)),
-                                });
-                                continue;
-                            }
-                        }
-                        match std::fs::write(&out_path, md.as_bytes()) {
-                            Ok(_) => Ok((size, md)),
-                            Err(e) => Err(format!("写入失败: {}", e)),
-                        }
-                    }
-                    Err(e) => Err(e),
-                };
+                let result = process(&task, &out_root, inject_frontmatter, &tx);
 
                 let elapsed_ms = t_start.elapsed().as_millis() as u64;
-                if tx.send(WorkerMsg::Finished { id: task.id, elapsed_ms, result }).is_err() {
+                if tx
+                    .send(WorkerMsg::Finished {
+                        id: task.id,
+                        elapsed_ms,
+                        result,
+                    })
+                    .is_err()
+                {
                     break; // 主线程已关闭
                 }
 
@@ -138,4 +232,40 @@ pub fn spawn(
     }
 
     rx
+}
+
+/// 单个任务的完整流程（带进度回传）
+fn process(
+    task: &Task,
+    out_root: &PathBuf,
+    inject_frontmatter: bool,
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+) -> Result<(u64, String), String> {
+    // ① 读取（真实字节进度）
+    let bytes = read_with_progress(&task.path, task.size, tx, task)?;
+
+    if task.is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
+
+    // ② 解析（官方内核，一次性；进度停在 30%→95%）
+    let md = parse_bytes(task, &bytes)?;
+
+    if task.is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
+
+    // 可选：注入 YAML Frontmatter
+    let md = if inject_frontmatter {
+        crate::frontmatter::inject(task, &md)
+    } else {
+        md
+    };
+    let size = md.len() as u64;
+
+    // ③ 写入（真实字节进度）
+    let out_path = task.output_path(out_root);
+    write_with_progress(&out_path, md.as_bytes(), tx, task)?;
+
+    Ok((size, md))
 }
