@@ -3,6 +3,8 @@
 // 配色对齐设计稿（Tailwind slate / blue 色系）
 // 所有尺寸为「逻辑像素」，实际绘制时按 DPI 缩放。
 
+use std::sync::OnceLock;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::*;
@@ -29,6 +31,7 @@ pub struct Theme {
     pub text_mute: COLORREF,
     pub blue: COLORREF,
     pub blue_hover: COLORREF,
+    pub blue500: COLORREF,
     pub blue_bg: COLORREF,
     pub blue_border: COLORREF,
     pub green: COLORREF,
@@ -63,6 +66,7 @@ impl Theme {
             text_mute: rgb(0x94, 0xA3, 0xB8),    // slate-400
             blue: rgb(0x25, 0x63, 0xEB),         // blue-600
             blue_hover: rgb(0x1D, 0x4E, 0xD8),  // blue-700
+            blue500: rgb(0x3B, 0x82, 0xF6),      // blue-500（进度条填充）
             blue_bg: rgb(0xEF, 0xF6, 0xFF),      // blue-50
             blue_border: rgb(0xDB, 0xEA, 0xFE),  // blue-100
             green: rgb(0x05, 0x96, 0x69),        // emerald-600
@@ -97,6 +101,7 @@ impl Theme {
             text_mute: rgb(0x76, 0x82, 0x94),
             blue: rgb(0x60, 0xA5, 0xFA),
             blue_hover: rgb(0x3B, 0x82, 0xF6),
+            blue500: rgb(0x60, 0xA5, 0xFA),
             blue_bg: rgb(0x1E, 0x2A, 0x45),
             blue_border: rgb(0x25, 0x3A, 0x5E),
             green: rgb(0x34, 0xD3, 0x99),
@@ -121,24 +126,26 @@ impl Theme {
 
 /// 字体集合（按设计稿的字号层级）
 pub struct Fonts {
-    pub brand: HFONT,     // 12 品牌条标题
+    pub brand: HFONT,     // 12 品牌条标题 (text-xs)
     pub mono: HFONT,      // 12 等宽（扩展名徽章 / 大小 / 路径）
-    pub h1: HFONT,        // 20 大标题
-    pub sub: HFONT,       // 12 副标题
-    pub btn: HFONT,       // 12 按钮
+    pub h1: HFONT,        // 20 大标题 (text-xl)
+    pub sub: HFONT,       // 12 副标题 (text-xs)
+    pub btn: HFONT,       // 12 按钮 (text-xs)
     pub btn_bold: HFONT,  // 12 按钮(粗)
-    pub thead: HFONT,     // 11 表头
-    pub name: HFONT,      // 13 文件名
-    pub meta: HFONT,      // 12 次要信息
-    pub tag: HFONT,       // 11 徽章
-    pub foot: HFONT,      // 12 底栏
-    pub big: HFONT,       // 20 大按钮
+    pub thead: HFONT,     // 11 表头 (text-[11px])
+    pub small: HFONT,     // 11 小字（表头 / 「更改」）
+    pub name: HFONT,      // 12 文件名 (text-xs)
+    pub meta: HFONT,      // 12 次要信息 (text-xs)
+    pub tag: HFONT,       // 10 徽章 (text-[10px])
+    pub foot: HFONT,      // 12 底栏 (text-xs)
+    pub big: HFONT,       // 14 大按钮
 }
 
 /// 创建等宽字体（设计稿里扩展名徽章/大小/路径用的就是等宽）
 pub fn make_mono(px: i32, weight: i32) -> HFONT {
     unsafe {
-        let face: Vec<u16> = "Consolas\0".encode_utf16().collect();
+        let face = mono_family().to_string();
+        let face: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
         CreateFontW(
             dpi::font_px(px), 0, 0, 0, weight, 0, 0, 0,
             DEFAULT_CHARSET.0 as u32,
@@ -154,7 +161,8 @@ pub fn make_mono(px: i32, weight: i32) -> HFONT {
 /// 创建字体（字号按 DPI 缩放）
 pub fn make_font(px: i32, weight: i32) -> HFONT {
     unsafe {
-        let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+        let face = ui_family().to_string();
+        let face: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
         CreateFontW(
             dpi::font_px(px),
             0, 0, 0, weight, 0, 0, 0,
@@ -166,6 +174,111 @@ pub fn make_font(px: i32, weight: i32) -> HFONT {
             PCWSTR(face.as_ptr()),
         )
     }
+}
+
+// ── 字体回退 ──
+// 首选 Microsoft YaHei UI（Windows 自带）；若系统没有（如精简版 / 服务端），
+// 依次回退到其它中文字体，避免中文变成方块。
+
+fn family_exists(name: &str) -> bool {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return false;
+        }
+        let face: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let hf = CreateFontW(
+            12, 0, 0, 0, 400, 0, 0, 0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            0,
+            PCWSTR(face.as_ptr()),
+        );
+        let old = SelectObject(hdc, HGDIOBJ(hf.0));
+        let mut buf = [0u16; 64];
+        let n = GetTextFaceW(hdc, Some(&mut buf));
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(hf.0));
+        let _ = ReleaseDC(None, hdc);
+        let actual = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        actual.eq_ignore_ascii_case(name)
+    }
+}
+
+/// 字体是否真的能画出中文（有些环境里字体名存在但没有汉字字形）
+fn family_renders_cjk(name: &str) -> bool {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return false;
+        }
+        let face: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let hf = CreateFontW(
+            12, 0, 0, 0, 400, 0, 0, 0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            0,
+            PCWSTR(face.as_ptr()),
+        );
+        let old = SelectObject(hdc, HGDIOBJ(hf.0));
+        let s: Vec<u16> = "文".encode_utf16().collect();
+        let mut gi: [u16; 1] = [0xFFFF; 1];
+        // GGI_MARK_NONEXISTING_GLYPHS = 1：没有的字形返回 0xFFFF
+        let r = GetGlyphIndicesW(hdc, PCWSTR(s.as_ptr()), 1, gi.as_mut_ptr(), 1);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(hf.0));
+        let _ = ReleaseDC(None, hdc);
+        r != 0 && gi[0] != 0xFFFF && gi[0] != 0
+    }
+}
+
+fn pick_family(candidates: &[&str]) -> String {
+    // 先按名字找，再确认它真的有汉字字形
+    for c in candidates {
+        if family_exists(c) && family_renders_cjk(c) {
+            return c.to_string();
+        }
+    }
+    for c in candidates {
+        if family_exists(c) {
+            return c.to_string();
+        }
+    }
+    candidates[0].to_string()
+}
+
+/// 界面字体族（只解析一次）
+pub fn ui_family() -> &'static str {
+    static F: OnceLock<&'static str> = OnceLock::new();
+    F.get_or_init(|| {
+        let s = pick_family(&[
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Noto Sans CJK SC",
+            "WenQuanYi Zen Hei",
+            "Segoe UI",
+        ]);
+        Box::leak(s.into_boxed_str())
+    })
+}
+
+/// 等宽字体族（只解析一次）
+pub fn mono_family() -> &'static str {
+    static F: OnceLock<&'static str> = OnceLock::new();
+    F.get_or_init(|| {
+        let s = pick_family(&[
+            "Consolas",
+            "Noto Sans Mono CJK SC",
+            "WenQuanYi Zen Hei",
+            "DejaVu Sans Mono",
+            "Courier New",
+        ]);
+        Box::leak(s.into_boxed_str())
+    })
 }
 
 /// 圆角矩形填充
@@ -272,7 +385,10 @@ pub fn measure_text(hdc: HDC, text: &str) -> SIZE {
     }
 }
 
-/// 药丸徽章（返回宽度）
+/// 徽章（返回宽度）
+///
+/// 设计稿里徽章统一是 `rounded`（4px 圆角）+ `px-1.5 py-0.5` 内边距，
+/// 不是胶囊形，所以圆角单独作为参数传入。
 pub fn draw_pill(
     hdc: HDC,
     text: &str,
@@ -286,18 +402,19 @@ pub fn draw_pill(
     unsafe {
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(font.0));
         let sz = measure_text(hdc, text);
-        let pad = dpi::px(7);
+        let pad = dpi::px(6);
         let w = sz.cx + pad * 2;
-        let h = dpi::px(19);
+        let h = dpi::px(17);
         let rect = RECT {
             left: x,
             top: center_y - h / 2,
             right: x + w,
             bottom: center_y + h / 2,
         };
-        fill_round_rect(hdc, &rect, h / 2, bg);
+        let r = dpi::px(4);
+        fill_round_rect(hdc, &rect, r, bg);
         if let Some(b) = border {
-            stroke_round_rect(hdc, &rect, h / 2, b, 1);
+            stroke_round_rect(hdc, &rect, r, b, 1);
         }
         draw_text(hdc, text, rect.left, rect.top, w, h, fg,
             DRAW_TEXT_FORMAT(DT_CENTER.0), false);
@@ -400,27 +517,138 @@ pub fn draw_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) 
     }
 }
 
-/// 文件夹图标（行的操作按钮）
-pub fn draw_folder_icon(hdc: HDC, x: i32, cy: i32, size: i32, color: COLORREF) {
+/// 文件夹图标（对齐 lucide folder 轮廓）
+///
+/// 参数是图标外接框的左上角 (x, top) 与边长 size；
+/// 圆角用折线近似，14px 下与设计稿几乎一致。
+pub fn draw_folder_icon(hdc: HDC, x: i32, top: i32, size: i32, color: COLORREF) {
     unsafe {
-        let pen = CreatePen(PS_SOLID, 1, color);
+        let pen = CreatePen(PS_SOLID, dpi::px(1).max(1), color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
-        let w = size;
-        let h = (size as f64 * 0.8) as i32;
-        let top = cy - h / 2;
-        // 文件夹标签
-        MoveToEx(hdc, x, top + dpi::px(3), None);
-        LineTo(hdc, x, top);
-        LineTo(hdc, x + w / 3, top);
-        LineTo(hdc, x + w / 3 + dpi::px(2), top + dpi::px(3));
-        LineTo(hdc, x + w, top + dpi::px(3));
-        // 主体
-        MoveToEx(hdc, x, top + dpi::px(3), None);
-        LineTo(hdc, x, top + h);
-        LineTo(hdc, x + w, top + h);
-        LineTo(hdc, x + w, top + dpi::px(3));
+        let f = size as f64 / 24.0;
+        let pts: [(i32, i32); 11] = [
+            (3, 7), (3, 17), (5, 19), (19, 19), (21, 17),
+            (21, 9), (19, 7), (13, 7), (11, 5), (5, 5), (3, 7),
+        ];
+        for (i, p) in pts.iter().enumerate() {
+            let px_ = x + (p.0 as f64 * f).round() as i32;
+            let py_ = top + (p.1 as f64 * f).round() as i32;
+            if i == 0 {
+                MoveToEx(hdc, px_, py_, None);
+            } else {
+                LineTo(hdc, px_, py_);
+            }
+        }
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 垃圾桶图标（对齐 lucide trash-2）
+pub fn draw_trash_icon(hdc: HDC, x: i32, top: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1).max(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let f = size as f64 / 24.0;
+        let P = |a: i32, b: i32| (x + (a as f64 * f).round() as i32, top + (b as f64 * f).round() as i32);
+        // 盖子
+        let (l1, l2) = P(4, 7);
+        let (r1, r2) = P(20, 7);
+        MoveToEx(hdc, l1, l2, None);
+        LineTo(hdc, r1, r2);
+        // 提手
+        let (h1, h2) = P(9, 7);
+        let (h3, h4) = P(9, 4);
+        let (h5, h6) = P(15, 4);
+        let (h7, h8) = P(15, 7);
+        MoveToEx(hdc, h1, h2, None);
+        LineTo(hdc, h3, h4);
+        LineTo(hdc, h5, h6);
+        LineTo(hdc, h7, h8);
+        // 桶身
+        let (b1, b2) = P(6, 7);
+        let (b3, b4) = P(7, 19);
+        let (b5, b6) = P(17, 19);
+        let (b7, b8) = P(18, 7);
+        MoveToEx(hdc, b1, b2, None);
+        LineTo(hdc, b3, b4);
+        LineTo(hdc, b5, b6);
+        LineTo(hdc, b7, b8);
+        // 内部竖线
+        let (v1, v2) = P(10, 11);
+        let (v3, v4) = P(10, 17);
+        MoveToEx(hdc, v1, v2, None);
+        LineTo(hdc, v3, v4);
+        let (w1, w2) = P(14, 11);
+        let (w3, w4) = P(14, 17);
+        MoveToEx(hdc, w1, w2, None);
+        LineTo(hdc, w3, w4);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 对勾图标（对齐 lucide check）
+pub fn draw_check_icon(hdc: HDC, x: i32, top: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(2).max(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let f = size as f64 / 24.0;
+        let pts: [(i32, i32); 3] = [(5, 13), (9, 17), (19, 7)];
+        for (i, p) in pts.iter().enumerate() {
+            let px_ = x + (p.0 as f64 * f).round() as i32;
+            let py_ = top + (p.1 as f64 * f).round() as i32;
+            if i == 0 {
+                MoveToEx(hdc, px_, py_, None);
+            } else {
+                LineTo(hdc, px_, py_);
+            }
+        }
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 叉号图标（行的删除按钮）
+///
+/// 不用「✕」字符——某些字体没有这个字形，会变成方块。
+pub fn draw_x_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, dpi::px(1).max(1), color);
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let h = size / 2;
+        MoveToEx(hdc, cx - h, cy - h, None);
+        LineTo(hdc, cx + h, cy + h);
+        MoveToEx(hdc, cx + h, cy - h, None);
+        LineTo(hdc, cx - h, cy + h);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// 闪电图标（实心，对齐 lucide zap）
+///
+/// 设计稿的「开始转换」按钮左侧是实心闪电，这里用多边形填充。
+pub fn draw_zap_icon(hdc: HDC, x: i32, top: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let pen = CreatePen(PS_SOLID, 1, color);
+        let old_b: HGDIOBJ = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_p: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let f = size as f64 / 24.0;
+        let pts: [(i32, i32); 6] = [(13, 2), (3, 14), (12, 14), (11, 22), (21, 10), (12, 10)];
+        let mut poly: Vec<POINT> = Vec::with_capacity(pts.len());
+        for p in pts.iter() {
+            poly.push(POINT {
+                x: x + (p.0 as f64 * f).round() as i32,
+                y: top + (p.1 as f64 * f).round() as i32,
+            });
+        }
+        let _ = Polygon(hdc, &poly);
+        let _ = SelectObject(hdc, old_p);
+        let _ = SelectObject(hdc, old_b);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+        let _ = DeleteObject(HGDIOBJ(brush.0));
     }
 }
 

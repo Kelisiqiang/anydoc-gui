@@ -4,7 +4,7 @@
 >
 > **解析内核：[firecrawl/anydoc](https://github.com/firecrawl/anydoc) v0.2.4（MIT）**
 
-一个用官方 anydoc 内核做的 Windows 桌面工具 —— 拖文件进去，出来 Markdown。
+一个用官方 anydoc 内核做的 **Windows 原生桌面工具** —— 拖文件进去，出来 Markdown。
 
 ---
 
@@ -23,33 +23,34 @@
 
 ## 下载
 
-Releases 页提供三个包：
+Releases 页提供一个包：
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `AnyDoc-Setup-v0.2.0.exe` | 3.6MB | **推荐**。安装版：桌面图标、PATH 配置、标准卸载 |
-| `anydoc-gui-v0.2.0-win-x64.zip` | 6.3MB | 图形版绿色包，解压即用 |
-| `anydoc-cli-v0.2.0-win-x64.zip` | 3.4MB | 命令行单文件 |
+| `AnyDoc-v0.5.0-win-x64-portable.zip` | ~3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
+
+> 只要免安装版。解压后目录结构要保留（`resources/` 里有图标资源）。
 
 ---
 
 ## 使用
 
-### 图形版
+1. 解压整个文件夹
+2. 双击 `AnyDoc.exe`
+3. 拖入文档（或点「添加文件 / 添加文件夹」）→ 确认输出目录 → 点「开始转换」
 
-1. 解压整个文件夹（`gui/` 目录必须保留）
-2. 双击 `anydoc-gui.exe`
-3. 浏览器自动打开界面
-4. 拖入文档 → 「开始转换」→「另存为」选择目录
+**转换进度直接显示在软件窗口里**，不用切到浏览器；转换完成后点行尾的
+文件夹图标即可打开输出目录。
 
-> 转换全部在**本地浏览器 WebAssembly** 中完成，文件不上传任何服务器。
+> 全部转换在本地完成，文件不上传任何服务器。
 
-### 命令行
+### 命令行（可选）
+
+同一个 exe 也带 CLI 模式：
 
 ```cmd
-anydoc.exe report.docx              :: 单文件
-anydoc.exe .\docs\ -r               :: 递归整个目录
-anydoc.exe .\docs\ -o .\md\ -r -v   :: 指定输出 + 详细日志
+AnyDoc.exe report.docx              :: 单文件
+AnyDoc.exe .\docs\ -o .\md\         :: 指定输出目录
 ```
 
 ---
@@ -60,7 +61,7 @@ anydoc.exe .\docs\ -o .\md\ -r -v   :: 指定输出 + 详细日志
 |------|--------|
 | Word | `.doc` `.docx` `.docm` |
 | PowerPoint | `.ppt` `.pptx` `.pptm` |
-| Excel | `.xls` `.xlsx` `.xlsm` |
+| Excel | `.xls` `.xlsx` `.xlsm` `.xlsb` |
 | OpenDocument | `.odt` `.ods` `.odp` |
 | 其他 | `.rtf` `.epub` `.csv` `.pdf` |
 
@@ -76,25 +77,22 @@ anydoc 读取文件签名（PDF header、RTF open group、OLE stream name、ZIP 
 
 | 情况 | 行为 |
 |------|------|
-| 扫描件 / 图片版 PDF | ❌ 不支持，anydoc 本身不含 OCR |
-| 加密文档 | ❌ 报错 `encrypted` |
-| 结构损坏文件 | ❌ 报错 `malformed`（不会返回半成品） |
-| 超出安全限制 | ❌ 报错 `resourceLimit` |
+| 扫描件 / 图片版 PDF | ❌ 不支持，anydoc 本身不含 OCR（界面提示「需 OCR」） |
+| 加密文档 | ❌ 报错 `文件已加密` |
+| 结构损坏文件 | ❌ 报错 `文件结构损坏`（不会返回半成品） |
+| 超出安全限制 | ❌ 报错 `超出安全限制` |
 | Excel 公式 | 读取计算结果，不保留公式 |
 
-GUI 报错时会显示具体错误码和原因，不是笼统的「转换失败」。
+界面报错时会显示具体原因，不是笼统的「转换失败」。
 
 ---
 
 ## 从源码编译
 
-### 命令行版
-
 ```bash
 # 需要 Rust 1.88+（anydoc 0.2.4 要求 edition 2024）
 git clone <this-repo>
-cd cli
-cargo build --release
+cd native
 
 # 交叉编译 Windows
 rustup target add x86_64-pc-windows-gnu
@@ -102,11 +100,10 @@ export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-### GUI 前端
+核心逻辑测试：
 
 ```bash
-cd gui-web
-npm install @firecrawl/anydoc-wasm
+cd core-test && cargo test
 ```
 
 ---

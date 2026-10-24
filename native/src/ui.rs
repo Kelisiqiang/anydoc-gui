@@ -18,10 +18,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Ole::OleInitialize;
-use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetScrollInfo, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX,
-    PBM_SETPOS, PBS_SMOOTH,
-};
+use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -34,17 +31,21 @@ use crate::state::{AppState, Status, Task, WorkerMsg};
 use crate::worker;
 
 // ── 布局常量（逻辑像素）──
-const PAD: i32 = 24;
-// 布局常量 —— 严格对齐设计稿的 Tailwind 数值
-const BRAND_H: i32 = 40;      // h-10
-const HEAD_TOP: i32 = 20;     // pt-5
-const HEAD_BOT: i32 = 12;     // pb-3
-const FOOT_PAD: i32 = 16;     // py-4
-const ROW_H: i32 = 48;        // py-3 + 内容
-const THEAD_H: i32 = 34;      // py-2.5 + 内容
-const SCROLLBAR_W: i32 = 16;   // 系统滚动条
-const HEAD_H: i32 = 68;
-const FOOT_H: i32 = 64;
+const PAD: i32 = 24;         // px-6
+const BRAND_H: i32 = 40;     // h-10
+const HEAD_TOP: i32 = 20;    // pt-5
+const HEAD_BOT: i32 = 12;    // pb-3
+const HEAD_TEXT_H: i32 = 48; // h1(28) + mt-1(4) + 副标题(16)
+const FOOT_PAD: i32 = 16;    // py-4
+const ROW_H: i32 = 48;       // py-3 + 内容
+const THEAD_H: i32 = 34;     // py-2.5 + 内容
+const SCROLLBAR_W: i32 = 16; // 系统滚动条
+const FOOT_H: i32 = 68;      // py-4 + 按钮(36)
+const CARD_PAD_X: i32 = 16;  // 表格卡片 px-4
+const CARD_PAD_Y: i32 = 8;   // 工作区 py-2
+const GRID_GAP: i32 = 16;    // grid gap-4
+const BTN_H: i32 = 28;       // py-1.5 + 图标(16)
+const FOOT_BTN_H: i32 = 36;  // py-2.5 + 图标(16)
 
 // ── 命中区 ID ──
 const HIT_ADD_FILES: u32 = 1;
@@ -71,8 +72,6 @@ pub struct Ui {
     pub state: AppState,
     pub theme: Theme,
     pub hwnd: HWND,
-    pub hprogress: HWND,
-    pub hscroll: HWND,
     pub fonts: Fonts,
     pub icons: RefCell<Vec<Option<icons::IconEntry>>>,
     pub rx: RefCell<Option<std::sync::mpsc::Receiver<WorkerMsg>>>,
@@ -182,6 +181,57 @@ pub unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        // ── 自绘窗口边框 ──
+        // 客户区铺满整个窗口：否则系统会保留 WS_THICKFRAME 的边框，
+        // 窗口顶部会多出一条非客户区（表现为「顶部空白带」）。
+        WM_NCCALCSIZE => {
+            if wp.0 != 0 {
+                let pnc = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+                pnc.rgrc[0] = pnc.rgrc[1];
+            }
+            LRESULT(0)
+        }
+        // 客户区铺满后系统不再画可拖拽边框，这里自己实现边缘缩放
+        WM_NCHITTEST => {
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            let x = (lp.0 & 0xFFFF) as i16 as i32 - rc.left;
+            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32 - rc.top;
+            let w = rc.right - rc.left;
+            let h = rc.bottom - rc.top;
+            let b = dpi::px(6);
+            let maximized = is_maximized(hwnd);
+            let ht = if maximized {
+                HTCLIENT
+            } else {
+                let l = x < b;
+                let r = x >= w - b;
+                let t = y < b;
+                let bo = y >= h - b;
+                if t && l {
+                    HTTOPLEFT
+                } else if t && r {
+                    HTTOPRIGHT
+                } else if bo && l {
+                    HTBOTTOMLEFT
+                } else if bo && r {
+                    HTBOTTOMRIGHT
+                } else if l {
+                    HTLEFT
+                } else if r {
+                    HTRIGHT
+                } else if t {
+                    HTTOP
+                } else if bo {
+                    HTBOTTOM
+                } else {
+                    HTCLIENT
+                }
+            };
+            LRESULT(ht as isize)
+        }
+        // 不让系统画非客户区（标题栏边框）
+        WM_NCACTIVATE => LRESULT(1),
         WM_DROPFILES => {
             on_drop(hwnd, lp);
             LRESULT(0)
@@ -307,8 +357,6 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         state: AppState::new(),
         theme: Theme::light(),
         hwnd,
-        hprogress: HWND(std::ptr::null_mut()),
-        hscroll: HWND(std::ptr::null_mut()),
         fonts: make_fonts(),
         icons: RefCell::new(Vec::new()),
         rx: RefCell::new(None),
@@ -327,32 +375,9 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
     // 通用控件初始化
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_PROGRESS_CLASS | ICC_BAR_CLASSES,
+        dwICC: ICC_BAR_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
-
-    // 底部进度条
-    let hprogress = match CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("msctls_progress32"),
-        w!(""),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(PBS_SMOOTH),
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        HMENU(106 as isize as *mut std::ffi::c_void),
-        hinst,
-        None,
-    ) {
-        Ok(h) => h,
-        Err(_) => HWND(std::ptr::null_mut()),
-    };
-    {
-        let mut u = ui.borrow_mut();
-        u.hprogress = hprogress;
-    }
 
     let _ = SetTimer(hwnd, TIMER_TICK, 40, None);
     Ok(())
@@ -360,17 +385,18 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
 
 fn make_fonts() -> Fonts {
     Fonts {
-        brand: make_font(13, 600),
-        mono: make_mono(13, 500),
-        h1: make_font(21, 700),
-        sub: make_font(13, 400),
-        btn: make_font(13, 500),
-        btn_bold: make_font(13, 600),
-        thead: make_font(12, 700),
-        name: make_font(14, 600),
-        meta: make_font(13, 500),
-        tag: make_font(11, 600),
-        foot: make_font(13, 500),
+        brand: make_font(12, 600),
+        mono: make_mono(12, 500),
+        h1: make_font(20, 700),
+        sub: make_font(12, 400),
+        btn: make_font(12, 500),
+        btn_bold: make_font(12, 600),
+        thead: make_font(11, 600),
+        small: make_font(11, 500),
+        name: make_font(12, 600),
+        meta: make_font(12, 500),
+        tag: make_font(10, 600),
+        foot: make_font(12, 500),
         big: make_font(14, 700),
     }
 }
@@ -414,13 +440,13 @@ fn compute_layout(hwnd: HWND) -> Layout {
         // 标题栏
         let brand = RECT { left: 0, top: 0, right: cw, bottom: dpi::px(BRAND_H) };
 
-        // 头部：pt-5 起，内容高 28(标题)+20(副标题)，pb-3 收
+        // 头部：pt-5 起，内容高 48(标题+副标题)，pb-3 收
         let head_top = dpi::px(BRAND_H) + dpi::px(HEAD_TOP);
         let head = RECT {
             left: p,
             top: head_top,
             right: cw - p,
-            bottom: head_top + dpi::px(48) + dpi::px(HEAD_BOT),
+            bottom: head_top + dpi::px(HEAD_TEXT_H) + dpi::px(HEAD_BOT),
         };
 
         // 底部
@@ -431,15 +457,258 @@ fn compute_layout(hwnd: HWND) -> Layout {
             bottom: ch,
         };
 
-        // 工作区（列表 / 空状态共用）
+        // 工作区（列表 / 空状态共用）；卡片再缩进 py-2
         let work = RECT {
             left: p,
-            top: head.bottom,
+            top: head.bottom + dpi::px(CARD_PAD_Y),
             right: cw - p,
-            bottom: foot.top - dpi::px(8),
+            bottom: foot.top - dpi::px(CARD_PAD_Y),
         };
 
         Layout { cw, ch, brand, head, work, foot, card: work }
+    }
+}
+
+/// 表格列几何 —— 严格还原设计稿的 `grid grid-cols-12 gap-4 px-4`
+///
+/// 12 列 + 11 个 16px 间距，卡片内容宽 = 卡片宽 - 32。
+///   col-span-6 → 文档名称    col-span-2 → 大小
+///   col-span-3 → 转换状态    col-span-1 → 操作（右对齐）
+#[derive(Clone, Copy)]
+struct Cols {
+    name_x: i32,
+    name_w: i32,
+    size_x: i32,
+    size_w: i32,
+    status_x: i32,
+    status_w: i32,
+    action_x: i32,
+    action_w: i32,
+    /// 操作列右边缘（内容区右边界）
+    content_right: i32,
+}
+
+fn compute_cols(l: &Layout) -> Cols {
+    let gap = dpi::px(GRID_GAP);
+    let content_x = l.card.left + dpi::px(CARD_PAD_X);
+    let content_w = l.card.right - l.card.left - dpi::px(CARD_PAD_X) * 2;
+
+    // 12 等分 + 11 个 gap；用浮点算再取整，避免列位置整列偏移
+    let w = (content_w - gap * 11) as f64 / 12.0;
+    let off = |i: usize| -> i32 { ((i as f64) * (w + gap as f64)).round() as i32 };
+
+    let name_w = off(6) - gap;
+    let size_x = content_x + off(6);
+    let size_w = off(8) - off(6) - gap;
+    let status_x = content_x + off(8);
+    let status_w = off(11) - off(8) - gap;
+    let action_x = content_x + off(11);
+    let action_w = off(12) - off(11) - gap;
+
+    Cols {
+        name_x: content_x,
+        name_w,
+        size_x,
+        size_w,
+        status_x,
+        status_w,
+        action_x,
+        action_w,
+        content_right: content_x + off(12) - gap,
+    }
+}
+
+/// 头部按钮几何（内容宽度、右对齐、底对齐）
+///
+/// 设计稿：`inline-flex items-center px-3 py-1.5 ... rounded-lg`，
+/// 图标 14px + 间距 6px + 文字，右侧 space-x-2 间隔，整体贴右。
+struct HeadBtn {
+    id: u32,
+    rect: RECT,
+    label: &'static str,
+    /// 0 = 加号 / 1 = 文件夹 / 2 = 垃圾桶
+    icon: u8,
+    /// 文字起点相对 rect.left
+    text_dx: i32,
+}
+
+unsafe fn compute_head_buttons(hwnd: HWND, l: &Layout) -> Vec<HeadBtn> {
+    let font = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|u| u.borrow().fonts.btn)
+    });
+    let Some(font) = font else { return Vec::new() };
+
+    let specs: [(&'static str, u8, u32); 3] = [
+        ("添加文件", 0, HIT_ADD_FILES),
+        ("添加文件夹", 1, HIT_ADD_DIR),
+        ("清空", 2, HIT_CLEAR),
+    ];
+
+    let hdc = GetDC(hwnd);
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    let mut text_w = [0i32; 3];
+    for (i, (label, _, _)) in specs.iter().enumerate() {
+        text_w[i] = measure_text(hdc, label).cx;
+    }
+    let _ = SelectObject(hdc, old);
+    let _ = ReleaseDC(hwnd, hdc);
+
+    let icon = dpi::px(14);
+    let h = dpi::px(BTN_H);
+    // items-end：与头部文字块底部对齐
+    let y = l.head.top + dpi::px(HEAD_TEXT_H) - h;
+    let gap = dpi::px(8);
+
+    let mut out: Vec<HeadBtn> = Vec::with_capacity(3);
+    let mut x = l.head.right;
+    for (i, (label, kind, id)) in specs.iter().enumerate().rev() {
+        let (pad_l, pad_r, icon_gap) = if *kind == 2 {
+            (dpi::px(10), dpi::px(10), dpi::px(4))
+        } else {
+            (dpi::px(12), dpi::px(12), dpi::px(6))
+        };
+        let w = pad_l + icon + icon_gap + text_w[i] + pad_r;
+        x -= w;
+        out.push(HeadBtn {
+            id: *id,
+            rect: RECT { left: x, top: y, right: x + w, bottom: y + h },
+            label,
+            icon: *kind,
+            text_dx: pad_l + icon + icon_gap,
+        });
+        x -= gap;
+    }
+    out.reverse();
+    out
+}
+
+/// 底部栏几何
+struct FootLayout {
+    out_label: RECT,
+    out_box: RECT,
+    out_icon: RECT,
+    out_path: RECT,
+    change: RECT,
+    cb: i32,
+    cb_label: RECT,
+    status: RECT,
+    btn: RECT,
+}
+
+unsafe fn compute_foot(hwnd: HWND, l: &Layout) -> FootLayout {
+    let p = dpi::px(PAD);
+    let (f_foot, f_mono, f_small) = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .map(|u| {
+                let u = u.borrow();
+                (u.fonts.foot, u.fonts.mono, u.fonts.small)
+            })
+            .unwrap_or_default()
+    });
+
+    let out_label_text = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .and_then(|u| u.borrow().state.out_dir.as_ref().map(|d| d.display().to_string()))
+            .unwrap_or_else(|| "与源文件同目录".to_string())
+    });
+
+    let hdc = GetDC(hwnd);
+    let old = SelectObject(hdc, HGDIOBJ(f_foot.0));
+    let label_w = measure_text(hdc, "输出目录:").cx;
+    let _ = SelectObject(hdc, old);
+    let old = SelectObject(hdc, HGDIOBJ(f_mono.0));
+    let mut path_w = measure_text(hdc, &out_label_text).cx;
+    let _ = SelectObject(hdc, old);
+    let old = SelectObject(hdc, HGDIOBJ(f_small.0));
+    let change_w = measure_text(hdc, "更改").cx;
+    let _ = SelectObject(hdc, old);
+    let _ = ReleaseDC(hwnd, hdc);
+
+    // 路径过长时截断，保证底栏不被撑破
+    let max_path = dpi::px(210);
+    if path_w > max_path {
+        path_w = max_path;
+    }
+
+    // 纵向：py-4 内的内容带，按钮 36 高
+    let band_top = l.foot.top + dpi::px(FOOT_PAD);
+    let center = band_top + dpi::px(FOOT_BTN_H) / 2;
+
+    // 左组：输出目录标签 + 灰底框
+    let label_rect = RECT {
+        left: p,
+        top: center - dpi::px(10),
+        right: p + label_w,
+        bottom: center + dpi::px(10),
+    };
+    let box_h = dpi::px(24);
+    let box_x = label_rect.right + dpi::px(8);
+    let icon = dpi::px(14);
+    let box_w = dpi::px(10) + icon + dpi::px(6) + path_w + dpi::px(8) + change_w + dpi::px(10);
+    let box_rect = RECT {
+        left: box_x,
+        top: center - box_h / 2,
+        right: box_x + box_w,
+        bottom: center + box_h / 2,
+    };
+    let icon_rect = RECT {
+        left: box_x + dpi::px(10),
+        top: center - icon / 2,
+        right: box_x + dpi::px(10) + icon,
+        bottom: center + icon / 2,
+    };
+    let path_x = icon_rect.right + dpi::px(6);
+    let path_rect = RECT {
+        left: path_x,
+        top: center - dpi::px(11),
+        right: path_x + path_w,
+        bottom: center + dpi::px(11),
+    };
+    let change_x = path_rect.right + dpi::px(8);
+    let change_rect = RECT {
+        left: change_x,
+        top: center - dpi::px(10),
+        right: change_x + change_w,
+        bottom: center + dpi::px(10),
+    };
+
+    // 复选框（space-x-5）
+    let cb_x = box_rect.right + dpi::px(20);
+    let cb_label = RECT {
+        left: cb_x + dpi::px(15) + dpi::px(6),
+        top: center - dpi::px(10),
+        right: cb_x + dpi::px(15) + dpi::px(6) + dpi::px(140),
+        bottom: center + dpi::px(10),
+    };
+
+    // 右组：开始转换按钮 + 状态文字（space-x-4）
+    let btn_w = dpi::px(120);
+    let btn = RECT {
+        left: l.foot.right - p - btn_w,
+        top: band_top,
+        right: l.foot.right - p,
+        bottom: band_top + dpi::px(FOOT_BTN_H),
+    };
+    let status = RECT {
+        left: btn.left - dpi::px(16) - dpi::px(220),
+        top: center - dpi::px(10),
+        right: btn.left - dpi::px(16),
+        bottom: center + dpi::px(10),
+    };
+
+    FootLayout {
+        out_label: label_rect,
+        out_box: box_rect,
+        out_icon: icon_rect,
+        out_path: path_rect,
+        change: change_rect,
+        cb: cb_x,
+        cb_label,
+        status,
+        btn,
     }
 }
 
@@ -448,71 +717,41 @@ fn list_rect(hwnd: HWND) -> RECT {
     compute_layout(hwnd).work
 }
 
+/// 标题栏窗口按钮几何（设计稿：space-x-3，最右 16px 内边距）
+fn window_buttons(l: &Layout) -> Vec<(u32, RECT)> {
+    let p = dpi::px(16);
+    let sz = dpi::px(14);
+    let gap = dpi::px(12);
+    let close_cx = l.brand.right - p - sz / 2;
+    let max_cx = close_cx - gap - sz / 2;
+    let min_cx = max_cx - gap - sz / 2;
+    let w = dpi::px(30);
+    vec![
+        (HIT_MIN, RECT { left: min_cx - w / 2, top: l.brand.top, right: min_cx + w / 2, bottom: l.brand.bottom }),
+        (HIT_MAX, RECT { left: max_cx - w / 2, top: l.brand.top, right: max_cx + w / 2, bottom: l.brand.bottom }),
+        (HIT_CLOSE, RECT { left: close_cx - w / 2, top: l.brand.top, right: close_cx + w / 2, bottom: l.brand.bottom }),
+    ]
+}
+
 /// 重建命中区
-fn rebuild_hits(hwnd: HWND, l: &Layout) {
+unsafe fn rebuild_hits(hwnd: HWND, l: &Layout) {
     let mut hits: Vec<Hit> = Vec::new();
-    let p = dpi::px(PAD);
 
     // 标题栏右侧窗口按钮（自绘：最小化 / 最大化 / 关闭）
-    let wb = dpi::px(34);
-    let mut wx = l.brand.right;
-    wx -= wb;
-    hits.push(Hit {
-        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
-        id: HIT_CLOSE,
-    });
-    wx -= wb;
-    hits.push(Hit {
-        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
-        id: HIT_MAX,
-    });
-    wx -= wb;
-    hits.push(Hit {
-        rect: RECT { left: wx, top: l.brand.top, right: wx + wb, bottom: l.brand.bottom },
-        id: HIT_MIN,
-    });
+    for (id, rect) in window_buttons(l) {
+        hits.push(Hit { rect, id });
+    }
 
-    // 头部右侧三个按钮（从右往左排）
-    let btn_y = l.head.top + dpi::px(16);
-    let bh = dpi::px(32);
-    let mut x = l.head.right;
-    // 清空
-    x -= dpi::px(56);
-    hits.push(Hit {
-        rect: RECT { left: x, top: btn_y, right: x + dpi::px(56), bottom: btn_y + bh },
-        id: HIT_CLEAR,
-    });
-    x -= dpi::px(104) + dpi::px(8);
-    hits.push(Hit {
-        rect: RECT { left: x, top: btn_y, right: x + dpi::px(104), bottom: btn_y + bh },
-        id: HIT_ADD_DIR,
-    });
-    x -= dpi::px(96) + dpi::px(8);
-    hits.push(Hit {
-        rect: RECT { left: x, top: btn_y, right: x + dpi::px(96), bottom: btn_y + bh },
-        id: HIT_ADD_FILES,
-    });
+    // 头部右侧三个按钮（内容宽度、右对齐、底对齐）
+    for b in compute_head_buttons(hwnd, l) {
+        hits.push(Hit { rect: b.rect, id: b.id });
+    }
 
     // 底部：输出目录 / 复选框 / 开始按钮
-    let fy = l.foot.top + dpi::px(20);
-    // 输出目录
-    let od_w = dpi::px(230);
-    hits.push(Hit {
-        rect: RECT { left: p + dpi::px(58), top: fy - dpi::px(12), right: p + dpi::px(58) + od_w, bottom: fy + dpi::px(16) },
-        id: HIT_OUTDIR,
-    });
-    // 复选框
-    let cb_x = p + dpi::px(58) + od_w + dpi::px(20);
-    hits.push(Hit {
-        rect: RECT { left: cb_x, top: fy - dpi::px(10), right: cb_x + dpi::px(200), bottom: fy + dpi::px(14) },
-        id: HIT_FRONT,
-    });
-    // 开始转换按钮
-    let bw = dpi::px(132);
-    hits.push(Hit {
-        rect: RECT { left: l.foot.right - p - bw, top: fy - dpi::px(14), right: l.foot.right - p, bottom: fy + dpi::px(18) },
-        id: HIT_CONVERT,
-    });
+    let f = compute_foot(hwnd, l);
+    hits.push(Hit { rect: f.out_box, id: HIT_OUTDIR });
+    hits.push(Hit { rect: f.cb_label, id: HIT_FRONT });
+    hits.push(Hit { rect: f.btn, id: HIT_CONVERT });
 
     // 列表行（如果非空）
     let n = UI.with(|slot| {
@@ -552,24 +791,25 @@ fn rebuild_hits(hwnd: HWND, l: &Layout) {
                 .map(|(_, d)| *d)
                 .unwrap_or(false);
 
-            // 操作按钮：完成 → 文件夹；其他 → ✕
+            // 操作按钮：完成 → 文件夹；其他 → ✕（右对齐到内容区右边缘）
+            let cols = compute_cols(l);
             let (rect, id) = if is_done {
                 (
                     RECT {
-                        left: l.card.right - dpi::px(64),
+                        left: cols.content_right - dpi::px(18),
                         top: top + dpi::px(10),
-                        right: l.card.right - dpi::px(38),
-                        bottom: top + dpi::px(42),
+                        right: cols.content_right,
+                        bottom: top + dpi::px(38),
                     },
                     HIT_ROW_OPEN + row_idx as u32,
                 )
             } else {
                 (
                     RECT {
-                        left: l.card.right - dpi::px(54),
+                        left: cols.content_right - dpi::px(18),
                         top: top + dpi::px(10),
-                        right: l.card.right - dpi::px(34),
-                        bottom: top + dpi::px(42),
+                        right: cols.content_right,
+                        bottom: top + dpi::px(38),
                     },
                     HIT_ROW_DEL + row_idx as u32,
                 )
@@ -603,19 +843,6 @@ fn rebuild_hits(hwnd: HWND, l: &Layout) {
 pub unsafe fn layout(hwnd: HWND) {
     let l = compute_layout(hwnd);
     rebuild_hits(hwnd, &l);
-    // 底部进度条（真实控件，压在自绘底栏上）
-    let p = dpi::px(PAD);
-    if let Ok(pb) = GetDlgItem(hwnd, 106) {
-        let _ = SetWindowPos(
-            pb,
-            None,
-            p,
-            l.foot.top - dpi::px(3),
-            l.cw - p * 2,
-            dpi::px(4),
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    }
 }
 
 // ── 绘制 ──
@@ -644,13 +871,13 @@ unsafe fn paint(hwnd: HWND) {
         let _ = DeleteObject(HGDIOBJ(bg.0));
 
         draw_brand(mem_dc, &ui, hwnd, &l);
-        draw_head(mem_dc, &ui, &l);
+        draw_head(mem_dc, &ui, hwnd, &l);
         if ui.state.tasks.is_empty() {
             draw_empty(mem_dc, &ui, &l);
         } else {
             draw_table(mem_dc, &ui, hwnd, &l);
         }
-        draw_foot(mem_dc, &ui, &l);
+        draw_foot(mem_dc, &ui, hwnd, &l);
     });
 
     let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
@@ -663,15 +890,15 @@ unsafe fn paint(hwnd: HWND) {
 /// ① 品牌条
 unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
-    let p = dpi::px(PAD);
+    let p = dpi::px(16);
 
-    // 白底 + 底边框
+    // 白底
     let card = CreateSolidBrush(th.card);
     FillRect(hdc, &l.brand, card);
     let _ = DeleteObject(HGDIOBJ(card.0));
 
-    // Logo：直接用 exe 资源里的应用图标
-    let logo_sz = dpi::px(22);
+    // Logo：直接用 exe 资源里的应用图标（设计稿 w-5 h-5 = 20px）
+    let logo_sz = dpi::px(20);
     let logo = RECT {
         left: p,
         top: (l.brand.bottom - logo_sz) / 2,
@@ -731,12 +958,12 @@ unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         let cx = (h.rect.left + h.rect.right) / 2;
         let cy = (h.rect.top + h.rect.bottom) / 2;
         match id {
-            HIT_MIN => draw_min_icon(hdc, cx, cy, dpi::px(11), color),
+            HIT_MIN => draw_min_icon(hdc, cx, cy, dpi::px(12), color),
             HIT_MAX => {
                 if maximized {
                     draw_restore_icon(hdc, cx, cy, dpi::px(11), color);
                 } else {
-                    draw_max_icon(hdc, cx, cy, dpi::px(11), color);
+                    draw_max_icon(hdc, cx, cy, dpi::px(10), color);
                 }
             }
             _ => draw_close_icon(hdc, cx, cy, dpi::px(11), color),
@@ -745,9 +972,8 @@ unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
 }
 
 /// ② 头部（大标题 + 副标题 + 操作按钮）
-unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
+unsafe fn draw_head(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
-    let p = dpi::px(PAD);
 
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.h1.0));
     draw_text(hdc, "文档转 Markdown", l.head.left, l.head.top, dpi::px(400), dpi::px(28),
@@ -763,15 +989,10 @@ unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
     let _ = SelectObject(hdc, old);
 
     // 三个按钮
-    let hits = ui.hits.borrow();
-    for (id, label, icon) in [
-        (HIT_ADD_FILES, "添加文件", 0u8),
-        (HIT_ADD_DIR, "添加文件夹", 1u8),
-        (HIT_CLEAR, "清空", 2u8),
-    ] {
-        let Some(h) = hits.iter().find(|h| h.id == id) else { continue };
-        let is_hot = ui.hot.get() == Some(id);
-        let is_clear = id == HIT_CLEAR;
+    let btns = compute_head_buttons(hwnd, l);
+    for b in &btns {
+        let is_hot = ui.hot.get() == Some(b.id);
+        let is_clear = b.icon == 2;
         let (fg, bg) = if is_clear {
             // 设计稿：清空 = 纯文字，无边框无底色
             (if is_hot { th.red } else { th.slate_400 }, th.card)
@@ -779,27 +1000,31 @@ unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
             (th.slate_700, if is_hot { th.slate_100 } else { th.card })
         };
         if !is_clear {
-            fill_round_rect(hdc, &h.rect, dpi::px(8), bg);
-            stroke_round_rect(hdc, &h.rect, dpi::px(8), th.border, 1);
+            fill_round_rect(hdc, &b.rect, dpi::px(8), bg);
+            stroke_round_rect(hdc, &b.rect, dpi::px(8), th.border, 1);
         }
 
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn.0));
-        let ty = (h.rect.top + h.rect.bottom) / 2;
-        let mut tx = h.rect.left + dpi::px(12);
-        match icon {
+        let ty = (b.rect.top + b.rect.bottom) / 2;
+        let icon_sz = dpi::px(14);
+        let icon_top = ty - icon_sz / 2;
+        match b.icon {
             0 => {
-                draw_plus_icon(hdc, tx + dpi::px(7), ty, dpi::px(14), th.blue);
-                tx += dpi::px(20);
+                // 加号（blue-500）
+                draw_plus_icon(hdc, b.rect.left + dpi::px(12) + icon_sz / 2, ty, icon_sz - dpi::px(2),
+                    th.blue500);
             }
             1 => {
-                draw_folder_icon(hdc, tx, ty - dpi::px(5), dpi::px(14), th.amber);
-                tx += dpi::px(20);
+                // 文件夹（amber-500）
+                draw_folder_icon(hdc, b.rect.left + dpi::px(12), icon_top, icon_sz, th.amber);
             }
             _ => {
-                tx += dpi::px(2);
+                // 垃圾桶（跟随文字颜色）
+                draw_trash_icon(hdc, b.rect.left + dpi::px(10), icon_top, icon_sz, fg);
             }
         }
-        draw_text(hdc, label, tx, h.rect.top, h.rect.right - tx, h.rect.bottom - h.rect.top,
+        let tx = b.rect.left + b.text_dx;
+        draw_text(hdc, b.label, tx, b.rect.top, b.rect.right - tx - dpi::px(8), b.rect.bottom - b.rect.top,
             fg, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
         let _ = SelectObject(hdc, old);
     }
@@ -878,7 +1103,6 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
 /// ④ 表格（列表态）
 unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
-    let p = dpi::px(PAD);
 
     // 卡片
     let card = CreateSolidBrush(th.card);
@@ -886,12 +1110,8 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let _ = DeleteObject(HGDIOBJ(card.0));
     stroke_round_rect(hdc, &l.card, dpi::px(12), th.border, 1);
 
-    // 列位置
-    let name_x = l.card.left + dpi::px(16);
-    let name_w = (l.card.right - l.card.left) * 46 / 100;
-    let size_r = l.card.left + (l.card.right - l.card.left) * 62 / 100;
-    let status_x = l.card.left + (l.card.right - l.card.left) * 64 / 100;
-    let status_w = (l.card.right - l.card.left) * 26 / 100;
+    // 列位置（严格还原 grid-cols-12 gap-4）
+    let cols = compute_cols(l);
 
     // 表头
     let hr = RECT { left: l.card.left, top: l.card.top, right: l.card.right, bottom: l.card.top + dpi::px(THEAD_H) };
@@ -904,13 +1124,14 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     // 设计稿表头用了 tracking-wider（字间距）
     SetTextCharacterExtra(hdc, dpi::px(1));
     let hy = hr.top;
-    draw_text(hdc, "文档名称", name_x, hy, name_w, hr.bottom - hy, th.text_dim,
+    let hh = hr.bottom - hy;
+    draw_text(hdc, "文档名称", cols.name_x, hy, cols.name_w, hh, th.text_dim,
         DRAW_TEXT_FORMAT(DT_LEFT.0), false);
-    draw_text(hdc, "大小", size_r - dpi::px(60), hy, dpi::px(60), hr.bottom - hy, th.text_dim,
-        DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
-    draw_text(hdc, "转换状态", status_x, hy, status_w, hr.bottom - hy, th.text_dim,
+    draw_text(hdc, "大小", cols.size_x, hy, cols.size_w, hh, th.text_dim,
         DRAW_TEXT_FORMAT(DT_LEFT.0), false);
-    draw_text(hdc, "操作", l.card.right - dpi::px(76), hy, dpi::px(44), hr.bottom - hy, th.text_dim,
+    draw_text(hdc, "转换状态", cols.status_x, hy, cols.status_w, hh, th.text_dim,
+        DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    draw_text(hdc, "操作", cols.action_x, hy, cols.action_w, hh, th.text_dim,
         DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
     SetTextCharacterExtra(hdc, 0);
     let _ = SelectObject(hdc, old);
@@ -951,95 +1172,104 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         let (fg, bgc, bd) = ext_style(th, &task.ext);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
         let tag = task.ext.to_uppercase();
-        let tw = draw_pill(hdc, &tag, name_x, cy, fg, bgc, ui.fonts.mono, bd);
+        let tw = draw_pill(hdc, &tag, cols.name_x, cy, fg, bgc, ui.fonts.mono, bd);
         let _ = SelectObject(hdc, old);
 
         // 文件名
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
-        draw_text(hdc, &task.name, name_x + tw + dpi::px(10), top + dpi::px(11),
-            name_w - tw - dpi::px(20), dpi::px(19), th.slate_700,
+        draw_text(hdc, &task.name, cols.name_x + tw + dpi::px(10), top + dpi::px(11),
+            cols.name_w - tw - dpi::px(20), dpi::px(19), th.slate_700,
             DRAW_TEXT_FORMAT(DT_LEFT.0), true);
         let _ = SelectObject(hdc, old);
 
-        // 大小
+        // 大小（设计稿：与表头「大小」左对齐）
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
         draw_text(hdc, &crate::state::fmt_size(task.size),
-            size_r - dpi::px(60), cy - dpi::px(10), dpi::px(60), dpi::px(20),
-            th.text_dim, DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+            cols.size_x, cy - dpi::px(10), cols.size_w, dpi::px(20),
+            th.text_dim, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
         let _ = SelectObject(hdc, old);
 
         // 状态
         match &task.status {
             Status::Running => {
-                // 进行中：阶段文字 + 该文件独立的真实进度条
-                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+                // 进行中：阶段文字 + 百分比 + 该文件独立的真实进度条
+                // 三者共用同一个盒子（状态列宽 - pr-4），视觉上连成一体
+                let inner_x = cols.status_x;
+                let inner_w = cols.status_w - dpi::px(16);
                 let phase = if task.phase.is_empty() { "正在转换".to_string() } else { task.phase.clone() };
-                draw_text(hdc, &phase, status_x, cy - dpi::px(17),
-                    status_w - dpi::px(70), dpi::px(17), th.blue,
+                // 解析阶段无法细分进度（官方内核一次性调用），
+                // 用不确定态动画表示「正在进行」，而不是卡在一个数字上。
+                let indeterminate = task.phase == "解析转换";
+
+                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+                let phase_w = if indeterminate { inner_w } else { inner_w - dpi::px(44) };
+                draw_text(hdc, &phase, inner_x, cy - dpi::px(15),
+                    phase_w, dpi::px(16), th.blue,
                     DRAW_TEXT_FORMAT(DT_LEFT.0), true);
-                // 百分比（右对齐）；不确定阶段不显示数字
-                if task.phase != "解析转换" {
+                // 百分比（右对齐，与进度条同一盒子的右端）
+                if !indeterminate {
                     draw_text(hdc, &format!("{}%", task.progress),
-                        status_x + status_w - dpi::px(70), cy - dpi::px(17),
-                        dpi::px(70), dpi::px(17), th.blue,
+                        inner_x + inner_w - dpi::px(44), cy - dpi::px(15),
+                        dpi::px(44), dpi::px(16), th.blue,
                         DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
                 }
                 let _ = SelectObject(hdc, old);
 
-                // 进度条
+                // 进度条：轨道 + 填充，圆角铺满状态列宽
                 let bar = RECT {
-                    left: status_x,
+                    left: inner_x,
                     top: cy + dpi::px(3),
-                    right: status_x + status_w - dpi::px(70),
+                    right: inner_x + inner_w,
                     bottom: cy + dpi::px(9),
                 };
                 let bar_w = bar.right - bar.left;
-                let tb = CreateSolidBrush(th.slate_100);
-                FillRect(hdc, &bar, tb);
-                let _ = DeleteObject(HGDIOBJ(tb.0));
+                fill_round_rect(hdc, &bar, dpi::px(3), th.slate_200);
 
-                // 解析阶段无法细分进度（官方内核是一次性调用），
-                // 用不确定态动画表示「正在进行」，而不是卡在一个数字上。
-                let indeterminate = task.phase == "解析转换";
-                let pb = CreateSolidBrush(th.blue);
                 if indeterminate {
                     // 三角波往返
                     let t = (GetTickCount64() % 1600) as f64 / 1600.0;
                     let wave = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 };
                     let seg = bar_w / 4;
                     let x = bar.left + ((bar_w - seg) as f64 * wave) as i32;
-                    FillRect(
+                    fill_round_rect(
                         hdc,
                         &RECT { left: x, top: bar.top, right: x + seg, bottom: bar.bottom },
-                        pb,
+                        dpi::px(3),
+                        th.blue500,
                     );
                 } else {
                     // 真实百分比（读取 / 写入阶段）
                     let pw = bar_w * task.progress.min(100) as i32 / 100;
                     if pw > 0 {
-                        FillRect(
+                        fill_round_rect(
                             hdc,
                             &RECT { left: bar.left, top: bar.top, right: bar.left + pw, bottom: bar.bottom },
-                            pb,
+                            dpi::px(3),
+                            th.blue500,
                         );
                     }
                 }
-                let _ = DeleteObject(HGDIOBJ(pb.0));
             }
             Status::Done(_) | Status::Error(_) | Status::Wait => {
                 let (text, fg, bgc, _) = status_style(th, &task.status);
                 let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
-                // 成功带 ✓
-                let prefix = if matches!(task.status, Status::Done(_)) { "✓ " } else { "" };
-                draw_text(hdc, &format!("{prefix}{text}"), status_x, cy - dpi::px(10),
-                    status_w - dpi::px(60), dpi::px(20),
+                // 成功：图标 + 文字（设计稿是 lucide check + mr-1）
+                let is_done = matches!(task.status, Status::Done(_));
+                let text_x = if is_done {
+                    draw_check_icon(hdc, cols.status_x, cy - dpi::px(8), dpi::px(16), fg);
+                    cols.status_x + dpi::px(16) + dpi::px(4)
+                } else {
+                    cols.status_x
+                };
+                draw_text(hdc, &text, text_x, cy - dpi::px(10),
+                    cols.status_x + cols.status_w - dpi::px(20) - text_x, dpi::px(20),
                     if matches!(task.status, Status::Wait) { th.text_dim } else { fg },
                     DRAW_TEXT_FORMAT(DT_LEFT.0), true);
                 let _ = SelectObject(hdc, old);
             }
         }
 
-        // 操作列：按状态切换
+        // 操作列：按状态切换（右对齐到内容区右边缘）
         //   转换完成 → 文件夹图标（打开所在文件夹）
         //   转换中 / 排队中 / 失败 → ✕（移除该条）
         let is_done = matches!(task.status, Status::Done(_));
@@ -1047,14 +1277,11 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         let hot_del = ui.hot.get() == Some(HIT_ROW_DEL + i as u32);
 
         if is_done {
-            draw_folder_icon(hdc, l.card.right - dpi::px(56), cy - dpi::px(8), dpi::px(16),
+            draw_folder_icon(hdc, cols.content_right - dpi::px(16), cy - dpi::px(8), dpi::px(16),
                 if hot_open { th.blue } else { th.amber });
         } else {
-            let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn.0));
-            draw_text(hdc, "✕", l.card.right - dpi::px(54), cy - dpi::px(10), dpi::px(18), dpi::px(20),
-                if hot_del { th.red } else { th.slate_300 },
-                DRAW_TEXT_FORMAT(DT_CENTER.0), false);
-            let _ = SelectObject(hdc, old);
+            draw_x_icon(hdc, cols.content_right - dpi::px(9), cy, dpi::px(8),
+                if hot_del { th.red } else { th.slate_300 });
         }
 
         // 分隔线
@@ -1091,9 +1318,9 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
 }
 
 /// ⑤ 底部栏
-unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
+unsafe fn draw_foot(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
-    let p = dpi::px(PAD);
+    let f = compute_foot(hwnd, l);
 
     // 白底 + 上边框
     let card = CreateSolidBrush(th.card);
@@ -1101,19 +1328,16 @@ unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
     let _ = DeleteObject(HGDIOBJ(card.0));
     hline(hdc, l.foot.left, l.foot.right, l.foot.top, th.border);
 
-    let fy = l.foot.top + dpi::px(20);
-
-    // 输出目录
+    // 输出目录标签
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
-    draw_text(hdc, "输出目录:", p, fy - dpi::px(10), dpi::px(56), dpi::px(20),
+    draw_text(hdc, "输出目录:", f.out_label.left, f.out_label.top,
+        f.out_label.right - f.out_label.left, f.out_label.bottom - f.out_label.top,
         th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 
-    let od_x = p + dpi::px(58);
-    let od_w = dpi::px(230);
+    // 输出目录框（灰底圆角）
     let hot_out = ui.hot.get() == Some(HIT_OUTDIR);
-    let od_rect = RECT { left: od_x, top: fy - dpi::px(13), right: od_x + od_w, bottom: fy + dpi::px(15) };
-    fill_round_rect(hdc, &od_rect, dpi::px(6), if hot_out { th.slate_200 } else { th.slate_100 });
+    fill_round_rect(hdc, &f.out_box, dpi::px(6), if hot_out { th.slate_200 } else { th.slate_100 });
 
     let out_label = UI.with(|slot| {
         let slot = slot.borrow();
@@ -1121,53 +1345,65 @@ unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
             .and_then(|u| u.borrow().state.out_dir.as_ref().map(|d| d.display().to_string()))
             .unwrap_or_else(|| "与源文件同目录".to_string())
     });
+
+    // 文件夹图标（垂直居中）
+    draw_folder_icon(hdc, f.out_icon.left, f.out_icon.top,
+        f.out_icon.right - f.out_icon.left, th.slate_400);
+
+    // 路径（等宽字体）
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
-    draw_folder_icon(hdc, od_x + dpi::px(10), fy - dpi::px(6), dpi::px(14), th.slate_400);
-    draw_text(hdc, &out_label, od_x + dpi::px(28), fy - dpi::px(13), od_w - dpi::px(82), dpi::px(28),
+    draw_text(hdc, &out_label, f.out_path.left, f.out_path.top,
+        f.out_path.right - f.out_path.left, f.out_path.bottom - f.out_path.top,
         th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
+    let _ = SelectObject(hdc, old);
+
     // 「更改」
-    draw_text(hdc, "更改", od_rect.right - dpi::px(38), fy - dpi::px(13), dpi::px(32), dpi::px(28),
-        th.blue, DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
+    draw_text(hdc, "更改", f.change.left, f.change.top,
+        f.change.right - f.change.left, f.change.bottom - f.change.top,
+        th.blue, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 
     // 复选框
-    let cb_x = od_x + od_w + dpi::px(20);
     let checked = ui.inject_frontmatter.get();
-    draw_checkbox(hdc, cb_x, fy, checked, th);
+    let cb_center = (f.cb_label.top + f.cb_label.bottom) / 2;
+    draw_checkbox(hdc, f.cb, cb_center, checked, th);
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
-    draw_text(hdc, "注入 YAML Frontmatter", cb_x + dpi::px(22), fy - dpi::px(10), dpi::px(180), dpi::px(20),
+    draw_text(hdc, "注入 YAML Frontmatter", f.cb_label.left, f.cb_label.top,
+        f.cb_label.right - f.cb_label.left, f.cb_label.bottom - f.cb_label.top,
         th.slate_600, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 
-    // 状态文字
+    // 状态文字（右对齐，开始转换按钮左侧）
     let st = UI.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref().map(|u| u.borrow().state.status.clone()).unwrap_or_default()
     });
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
-    let stw = draw_text(hdc, &st, l.foot.right - p - dpi::px(150) - dpi::px(140), fy - dpi::px(10),
-        dpi::px(140), dpi::px(20), th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), true);
+    draw_text(hdc, &st, f.status.left, f.status.top,
+        f.status.right - f.status.left, f.status.bottom - f.status.top,
+        th.text_mute, DRAW_TEXT_FORMAT(DT_RIGHT.0), true);
     let _ = SelectObject(hdc, old);
 
     // 开始转换按钮
-    let bw = dpi::px(132);
-    let bh = dpi::px(34);
-    let br = RECT {
-        left: l.foot.right - p - bw,
-        top: fy - dpi::px(16),
-        right: l.foot.right - p,
-        bottom: fy - dpi::px(16) + bh,
-    };
     let running = UI.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref().map(|u| u.borrow().state.running).unwrap_or(false)
     });
     let (bg, fg) = if running { (th.slate_300, th.card) } else { (th.blue, rgb(0xFF, 0xFF, 0xFF)) };
-    fill_round_rect(hdc, &br, dpi::px(8), bg);
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.big.0));
-    draw_text(hdc, if running { "转换中…" } else { "开始转换" },
-        br.left, br.top, bw, bh, fg,
-        DRAW_TEXT_FORMAT(DT_CENTER.0), false);
+    fill_round_rect(hdc, &f.btn, dpi::px(8), bg);
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn_bold.0));
+    let label = if running { "转换中…" } else { "开始转换" };
+    let lw = measure_text(hdc, label).cx;
+    let icon_sz = dpi::px(16);
+    let gap = dpi::px(8);
+    let total = icon_sz + gap + lw;
+    let mut tx = f.btn.left + (f.btn.right - f.btn.left - total) / 2;
+    let ty = (f.btn.top + f.btn.bottom) / 2;
+    draw_zap_icon(hdc, tx, ty - icon_sz / 2, icon_sz, fg);
+    tx += icon_sz + gap;
+    draw_text(hdc, label, tx, f.btn.top, lw + dpi::px(4), f.btn.bottom - f.btn.top,
+        fg, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
 }
 
@@ -1644,13 +1880,6 @@ pub unsafe fn update_status(hwnd: HWND) {
             ui.borrow_mut().state.status = text;
         }
     });
-    if let Ok(pb) = GetDlgItem(hwnd, 106) {
-        let pct = UI.with(|slot| {
-            let slot = slot.borrow();
-            slot.as_ref().map(|u| u.borrow().state.stats.percent()).unwrap_or(0)
-        });
-        SendMessageW(pb, PBM_SETPOS, WPARAM(pct as usize), LPARAM(0));
-    }
     let _ = InvalidateRect(hwnd, None, false);
 }
 

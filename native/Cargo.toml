@@ -1,6 +1,6 @@
 [package]
 name = "anydoc-native"
-version = "0.3.0"
+version = "0.5.0"
 description = "AnyDoc for Windows - 原生窗口版文档转 Markdown 工具"
 authors = ["AnyDoc Team"]
 edition = "2021"
@@ -27,6 +27,7 @@ windows = { version = "0.58", features = [
   "Win32_System_LibraryLoader",
   "Win32_Storage_FileSystem",
   "Win32_System_Ole",
+  "Win32_System_SystemInformation",
   "Win32_System_Registry",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
