@@ -146,7 +146,7 @@ SmartScreen 就会拦。
 
 **方式 B：手动解除锁定**
 
-1. 右键 `AnyDoc-v0.5.0-win-x64-portable.zip` → **属性**
+1. 右键 `AnyDoc-v0.5.1-win-x64-portable.zip` → **属性**
 2. 底部勾选 **「解除锁定」** → 确定
 3. **重新解压**（在解除锁定之前解压出来的 exe 仍带标记）
 4. 双击 `AnyDoc.exe`

@@ -54,8 +54,8 @@ const HIT_CLEAR: u32 = 3;
 const HIT_OUTDIR: u32 = 4;
 const HIT_FRONT: u32 = 5;
 const HIT_CONVERT: u32 = 6;
-const HIT_ROW_DEL: u32 = 100; // + 行号
-const HIT_ROW_OPEN: u32 = 200; // + 行号
+const HIT_ROW_DEL: u32 = 100;   // 100..1099  删除（✕）
+const HIT_ROW_OPEN: u32 = 1100; // 1100..2099 打开所在文件夹（📂）
 const HIT_MIN: u32 = 300;
 const HIT_MAX: u32 = 301;
 const HIT_CLOSE: u32 = 302;
@@ -1550,7 +1550,7 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
         HIT_CONVERT => {
             start_convert(hwnd);
         }
-        id if id >= HIT_ROW_DEL && id < HIT_ROW_DEL + 1000 => {
+        id if id >= HIT_ROW_DEL && id < HIT_ROW_OPEN => {
             let idx = (id - HIT_ROW_DEL) as usize;
             UI.with(|slot| {
                 let slot = slot.borrow();
@@ -2028,15 +2028,36 @@ fn ensure_visible(hwnd: HWND, scroll: i32) {
     });
 }
 
-/// 在文件管理器中定位文件
+/// 在文件管理器中打开文件所在文件夹
+///
+/// 优先用 `explore` 直接定位到该文件（资源管理器会打开所在文件夹并选中它）；
+/// 失败时退回到「直接打开父目录」。
 unsafe fn reveal_in_folder(path: &std::path::Path) {
-    let wide = to_wide(&path.display().to_string());
     let verb = to_wide("explore");
     let file = to_wide(&path.display().to_string());
-    ShellExecuteW(
+    let r = ShellExecuteW(
         HWND(std::ptr::null_mut()),
         PCWSTR(verb.as_ptr()),
         PCWSTR(file.as_ptr()),
+        PCWSTR(std::ptr::null()),
+        PCWSTR(std::ptr::null()),
+        SW_SHOWNORMAL,
+    );
+    // ShellExecuteW 返回值 > 32 表示成功
+    if (r.0 as isize) > 32 {
+        return;
+    }
+    // 兜底：直接打开所在文件夹
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf());
+    let open_verb = to_wide("open");
+    let dir_w = to_wide(&dir.display().to_string());
+    let _ = ShellExecuteW(
+        HWND(std::ptr::null_mut()),
+        PCWSTR(open_verb.as_ptr()),
+        PCWSTR(dir_w.as_ptr()),
         PCWSTR(std::ptr::null()),
         PCWSTR(std::ptr::null()),
         SW_SHOWNORMAL,
