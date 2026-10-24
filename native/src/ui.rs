@@ -172,6 +172,13 @@ pub unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SIZE => {
+            let mut cr = RECT::default();
+            let _ = GetClientRect(hwnd, &mut cr);
+            diag(&format!(
+                "WM_SIZE 客户区={} 缩放={}",
+                rstr(&cr),
+                dpi::scale()
+            ));
             layout(hwnd);
             let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
@@ -187,28 +194,38 @@ pub unsafe extern "system" fn wnd_proc(
         WM_NCCALCSIZE => {
             if wp.0 != 0 {
                 let pnc = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
-                if is_maximized(hwnd) {
-                    // 最大化时窗口会比工作区多出隐形的缩放边框（Win10/11 每边约 8px），
-                    // 客户区若铺满整个窗口，右侧的窗口按钮会被挤出屏幕看不见。
-                    // 这里按系统边框宽度把客户区往里收，用的是「相对窗口矩形」的偏移，
-                    // 不牵扯屏幕/窗口两套坐标系，最稳。
-                    let fx = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-                    let fy = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-                    let w = pnc.rgrc[1];
+                // WINDOWPOS 里的就是窗口在屏幕上的位置和尺寸（最可靠）
+                let pos = *pnc.lppos;
+                let win = RECT {
+                    left: pos.x,
+                    top: pos.y,
+                    right: pos.x + pos.cx,
+                    bottom: pos.y + pos.cy,
+                };
+                // 默认：客户区 = 整个窗口（无边框自绘）
+                let mut client = win;
+                let zoomed = is_maximized(hwnd);
+                if zoomed {
+                    // 最大化时窗口会比工作区多出隐形边框（Win10/11 每边几个像素），
+                    // 客户区要正好落在工作区上，否则右边那圈超出屏幕，按钮会被切掉。
+                    let wa = work_area(hwnd);
                     let c = RECT {
-                        left: w.left + fx,
-                        top: w.top + fy,
-                        right: w.right - fx,
-                        bottom: w.bottom - fy,
+                        left: wa.left.max(win.left),
+                        top: wa.top.max(win.top),
+                        right: wa.right.min(win.right),
+                        bottom: wa.bottom.min(win.bottom),
                     };
                     if c.right > c.left && c.bottom > c.top {
-                        pnc.rgrc[0] = c;
-                    } else {
-                        pnc.rgrc[0] = pnc.rgrc[1];
+                        client = c;
                     }
-                } else {
-                    pnc.rgrc[0] = pnc.rgrc[1];
                 }
+                pnc.rgrc[0] = client;
+                diag(&format!(
+                    "NCCALCSIZE zoom={zoomed} 窗口={} 工作区={} 客户区={}",
+                    rstr(&win),
+                    rstr(&work_area(hwnd)),
+                    rstr(&client)
+                ));
             }
             LRESULT(0)
         }
@@ -317,10 +334,11 @@ pub unsafe extern "system" fn wnd_proc(
             // 这里把最大尺寸限制在「工作区」范围内。
             let mmi = &mut *(lp.0 as *mut MINMAXINFO);
             let work = work_area(hwnd);
-            // ptMaxPosition 是相对「显示器」的，不能用工作区坐标，
+            let mon = monitor_rect(hwnd);
+            // ptMaxPosition 是相对「显示器原点」的，不能直接用工作区坐标，
             // 否则多显示器时窗口会跑到屏幕外面去（最大化就废了）
-            mmi.ptMaxPosition.x = 0;
-            mmi.ptMaxPosition.y = 0;
+            mmi.ptMaxPosition.x = work.left - mon.left;
+            mmi.ptMaxPosition.y = work.top - mon.top;
             mmi.ptMaxSize.x = work.right - work.left;
             mmi.ptMaxSize.y = work.bottom - work.top;
             mmi.ptMaxTrackSize.x = work.right - work.left;
@@ -355,6 +373,7 @@ const TIMER_TICK: usize = 1;
 
 // ── 创建控件 ──
 unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
+    diag("ON_CREATE_ENTER");
     let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
 
     // 加载应用图标（exe 资源 ID 1），用于左上角显示
@@ -397,6 +416,28 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
     let _ = InitCommonControlsEx(&icc);
 
     let _ = SetTimer(hwnd, TIMER_TICK, 40, None);
+    diag("ON_CREATE_AFTER_TIMER");
+
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    let mut wr = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut wr);
+    let theme_name = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().map(|ui| {
+            let ui = ui.borrow();
+            format!("bg={:?} 卡片={:?}", ui.theme.bg, ui.theme.card)
+        })
+    });
+    diag(&format!(
+        "启动：缩放={}% 客户区={} 窗口={} 工作区={} 字体={:?} 主题={:?}",
+        dpi::scale(),
+        rstr(&cr),
+        rstr(&wr),
+        rstr(&work_area(hwnd)),
+        crate::draw::ui_family(),
+        theme_name
+    ));
     Ok(())
 }
 
@@ -453,8 +494,14 @@ fn compute_layout(hwnd: HWND) -> Layout {
     unsafe {
         let mut cr = RECT::default();
         let _ = GetClientRect(hwnd, &mut cr);
-        let cw = cr.right - cr.left;
-        let ch = cr.bottom - cr.top;
+        let mut cw = cr.right - cr.left;
+        let mut ch = cr.bottom - cr.top;
+        // 客户区异常（0 或大得离谱）时夹到安全范围，
+        // 避免建出超大位图失败 → 选进 NULL → 整个界面画不出来（黑屏）
+        if cw <= 0 { cw = 1; }
+        if ch <= 0 { ch = 1; }
+        if cw > 10000 { cw = 10000; }
+        if ch > 10000 { ch = 10000; }
         let p = dpi::px(PAD);
 
         // 标题栏
@@ -753,6 +800,74 @@ fn window_buttons(l: &Layout) -> Vec<(u32, RECT)> {
     ]
 }
 
+// ── 诊断日志 ──
+// 写到 exe 同目录的 anydoc-diag.log（写不进去就退到 %TEMP%），
+// 出问题时把这个文件发给开发者，能一眼看出窗口/客户区/缩放的真实数值。
+
+fn diag_path() -> std::path::PathBuf {
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    use windows::Win32::Foundation::HMODULE;
+    unsafe {
+        let hinst = GetModuleHandleW(None);
+        if let Ok(h) = hinst {
+            let mut buf = [0u16; 260];
+            let n = GetModuleFileNameW(HMODULE(h.0), &mut buf);
+            if n > 0 {
+                let exe = String::from_utf16_lossy(&buf[..n as usize]);
+                if let Some(dir) = std::path::Path::new(&exe).parent() {
+                    let p = dir.join("anydoc-diag.log");
+                    // 目录可写就用它
+                    if std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)
+                        .is_ok()
+                    {
+                        return p;
+                    }
+                }
+            }
+        }
+    }
+    std::env::temp_dir().join("anydoc-diag.log")
+}
+
+pub fn diag(msg: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{ts}] {msg}");
+    // 注意：这里绝不能用 eprintln!，GUI 程序从资源管理器启动时 stderr 是无效句柄，
+    // eprintln! 会直接 panic，把程序搞挂。
+    // 依次尝试：exe 同目录 → 当前工作目录 → %TEMP%
+    let mut cands: Vec<std::path::PathBuf> = vec![diag_path()];
+    cands.push(std::path::PathBuf::from("anydoc-diag.log"));
+    cands.push(std::env::temp_dir().join("anydoc-diag.log"));
+    for p in cands {
+        // 日志别无限长：超过 200KB 就重新开一个
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.len() > 200_000 {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+            return;
+        }
+    }
+}
+
+fn rstr(r: &RECT) -> String {
+    format!("({},{},{},{})", r.left, r.top, r.right, r.bottom)
+}
+
 /// 重建命中区
 unsafe fn rebuild_hits(hwnd: HWND, l: &Layout) {
     let mut hits: Vec<Hit> = Vec::new();
@@ -874,10 +989,46 @@ unsafe fn paint(hwnd: HWND) {
     let cw = l.cw;
     let ch = l.ch;
 
+    // 客户区异常（0 或大得离谱）时不要去建位图，
+    // 否则 CreateCompatibleBitmap 失败 → 选进 NULL → 整个界面画不出来（黑屏）
+    if cw <= 0 || ch <= 0 || cw > 20000 || ch > 20000 {
+        diag(&format!(
+            "paint 跳过：客户区异常 cw={cw} ch={ch} 窗口={}",
+            rstr(&l.brand)
+        ));
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
+
     // 双缓冲
     let mem_dc = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
-    let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+    // 位图太大（内存不够）时别硬撑，直接往窗口 DC 上画
+    let double_buffer = !bmp.0.is_null() && (cw as i64) * (ch as i64) <= 30_000_000;
+    let (target, old_bmp) = if double_buffer {
+        let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+        (mem_dc, Some(old))
+    } else {
+        // 位图建不出来（内存不够 / 客户区太大）→ 直接往窗口 DC 上画，
+        // 至少还能显示内容，绝不黑屏
+        diag(&format!("放弃双缓冲，直接绘制 cw={cw} ch={ch}"));
+        (hdc, None)
+    };
+
+    // 先把背景直接刷到窗口上：即使后面哪一步出问题，也不会留下黑屏
+    let bg0 = {
+        UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|ui| {
+                let ui = ui.borrow();
+                CreateSolidBrush(ui.theme.bg)
+            })
+        })
+    };
+    if let Some(bg0) = bg0 {
+        let _ = FillRect(hdc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg0);
+        let _ = DeleteObject(HGDIOBJ(bg0.0));
+    }
 
     UI.with(|slot| {
         let slot = slot.borrow();
@@ -887,22 +1038,24 @@ unsafe fn paint(hwnd: HWND) {
 
         // 背景
         let bg = CreateSolidBrush(th.bg);
-        FillRect(mem_dc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
+        FillRect(target, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
 
-        draw_brand(mem_dc, &ui, hwnd, &l);
-        draw_head(mem_dc, &ui, hwnd, &l);
+        draw_brand(target, &ui, hwnd, &l);
+        draw_head(target, &ui, hwnd, &l);
         if ui.state.tasks.is_empty() {
-            draw_empty(mem_dc, &ui, &l);
+            draw_empty(target, &ui, &l);
         } else {
-            draw_table(mem_dc, &ui, hwnd, &l);
+            draw_table(target, &ui, hwnd, &l);
         }
-        draw_foot(mem_dc, &ui, hwnd, &l);
+        draw_foot(target, &ui, hwnd, &l);
     });
 
-    let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
-    let _ = SelectObject(mem_dc, old_bmp);
-    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    if double_buffer {
+        let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
+        let _ = SelectObject(mem_dc, old_bmp.unwrap());
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+    }
     let _ = DeleteDC(mem_dc);
     let _ = EndPaint(hwnd, &ps);
 }
@@ -2179,6 +2332,24 @@ pub unsafe fn preload_folder(hwnd: HWND, dir: &PathBuf) {
 
 
 /// 窗口所在显示器的工作区（屏幕坐标）
+/// 窗口所在显示器的整个矩形（屏幕坐标）
+unsafe fn monitor_rect(hwnd: HWND) -> RECT {
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(mon, &mut mi).as_bool() && mi.rcMonitor.right > mi.rcMonitor.left {
+        return mi.rcMonitor;
+    }
+    RECT {
+        left: 0,
+        top: 0,
+        right: GetSystemMetrics(SM_CXSCREEN),
+        bottom: GetSystemMetrics(SM_CYSCREEN),
+    }
+}
+
 unsafe fn work_area(hwnd: HWND) -> RECT {
     let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     let mut mi = MONITORINFO {

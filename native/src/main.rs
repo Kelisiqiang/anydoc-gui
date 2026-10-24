@@ -22,6 +22,39 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 fn main() {
+    ui::diag("MAIN_ENTER");
+    // 崩溃也要留证据：panic 时写日志 + 弹窗，界面黑掉时能一眼定位
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            std::panic::set_hook(Box::new(|info| {
+                let msg = format!("panic: {info}");
+                ui::diag(&msg);
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MessageBoxW, MB_ICONERROR, MB_OK,
+                };
+                use windows::core::PCWSTR;
+                let text: Vec<u16> = "AnyDoc 遇到问题，请把 anydoc-diag.log 发给开发者"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let title: Vec<u16> = "AnyDoc"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe {
+                    let _ = MessageBoxW(
+                        None,
+                        PCWSTR(text.as_ptr()),
+                        PCWSTR(title.as_ptr()),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }));
+        });
+    }
+
     // 参数解析
     //   anydoc                 → GUI 模式
     //   anydoc --gui [文件...]  → GUI 模式 + 预加载文件（测试/便捷用）
