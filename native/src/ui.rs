@@ -10,15 +10,17 @@ use std::rc::Rc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE,
 };
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETPOS,
-    PBS_SMOOTH,
+    InitCommonControlsEx, SetScrollInfo, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX,
+    PBM_SETPOS, PBS_SMOOTH,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::*;
@@ -33,12 +35,16 @@ use crate::worker;
 
 // ── 布局常量（逻辑像素）──
 const PAD: i32 = 24;
-const BRAND_H: i32 = 40;
+// 布局常量 —— 严格对齐设计稿的 Tailwind 数值
+const BRAND_H: i32 = 40;      // h-10
+const HEAD_TOP: i32 = 20;     // pt-5
+const HEAD_BOT: i32 = 12;     // pb-3
+const FOOT_PAD: i32 = 16;     // py-4
+const ROW_H: i32 = 48;        // py-3 + 内容
+const THEAD_H: i32 = 34;      // py-2.5 + 内容
+const SCROLLBAR_W: i32 = 16;   // 系统滚动条
 const HEAD_H: i32 = 68;
 const FOOT_H: i32 = 64;
-const ROW_H: i32 = 48;
-const THEAD_H: i32 = 34;
-const SCROLLBAR_W: i32 = 14;
 
 // ── 命中区 ID ──
 const HIT_ADD_FILES: u32 = 1;
@@ -52,6 +58,7 @@ const HIT_ROW_OPEN: u32 = 200; // + 行号
 const HIT_MIN: u32 = 300;
 const HIT_MAX: u32 = 301;
 const HIT_CLOSE: u32 = 302;
+const HIT_SCROLL_TRACK: u32 = 400;
 
 /// 可点击区域
 #[derive(Clone, Copy)]
@@ -65,6 +72,7 @@ pub struct Ui {
     pub theme: Theme,
     pub hwnd: HWND,
     pub hprogress: HWND,
+    pub hscroll: HWND,
     pub fonts: Fonts,
     pub icons: RefCell<Vec<Option<icons::IconEntry>>>,
     pub rx: RefCell<Option<std::sync::mpsc::Receiver<WorkerMsg>>>,
@@ -120,6 +128,8 @@ pub fn register_class() {
 /// 创建主窗口
 pub fn create(hinst: HINSTANCE) -> HWND {
     unsafe {
+        // TEMP DIAG
+        let _ = &hinst;
         let hwnd = CreateWindowExW(
             // WS_EX_APPWINDOW：WS_POPUP 窗口必须带这个才会出现在任务栏 / Alt+Tab
             WS_EX_APPWINDOW,
@@ -298,6 +308,7 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         theme: Theme::light(),
         hwnd,
         hprogress: HWND(std::ptr::null_mut()),
+        hscroll: HWND(std::ptr::null_mut()),
         fonts: make_fonts(),
         icons: RefCell::new(Vec::new()),
         rx: RefCell::new(None),
@@ -319,9 +330,6 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         dwICC: ICC_PROGRESS_CLASS | ICC_BAR_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
-
-    // 拖放需要 OLE
-    let _ = OleInitialize(None);
 
     // 底部进度条
     let hprogress = match CreateWindowExW(
@@ -403,29 +411,41 @@ fn compute_layout(hwnd: HWND) -> Layout {
         let ch = cr.bottom - cr.top;
         let p = dpi::px(PAD);
 
+        // 标题栏
         let brand = RECT { left: 0, top: 0, right: cw, bottom: dpi::px(BRAND_H) };
+
+        // 头部：pt-5 起，内容高 28(标题)+20(副标题)，pb-3 收
+        let head_top = dpi::px(BRAND_H) + dpi::px(HEAD_TOP);
         let head = RECT {
             left: p,
-            top: dpi::px(BRAND_H) + dpi::px(18),
+            top: head_top,
             right: cw - p,
-            bottom: dpi::px(BRAND_H) + dpi::px(18) + dpi::px(HEAD_H),
+            bottom: head_top + dpi::px(48) + dpi::px(HEAD_BOT),
         };
+
+        // 底部
         let foot = RECT {
             left: 0,
             top: ch - dpi::px(FOOT_H),
             right: cw,
             bottom: ch,
         };
+
+        // 工作区（列表 / 空状态共用）
         let work = RECT {
             left: p,
-            top: head.bottom + dpi::px(6),
+            top: head.bottom,
             right: cw - p,
             bottom: foot.top - dpi::px(8),
         };
-        let card = work;
 
-        Layout { cw, ch, brand, head, work, foot, card }
+        Layout { cw, ch, brand, head, work, foot, card: work }
     }
+}
+
+/// 列表区域（工作区）
+fn list_rect(hwnd: HWND) -> RECT {
+    compute_layout(hwnd).work
 }
 
 /// 重建命中区
@@ -536,9 +556,9 @@ fn rebuild_hits(hwnd: HWND, l: &Layout) {
             let (rect, id) = if is_done {
                 (
                     RECT {
-                        left: l.card.right - dpi::px(52),
+                        left: l.card.right - dpi::px(64),
                         top: top + dpi::px(10),
-                        right: l.card.right - dpi::px(24),
+                        right: l.card.right - dpi::px(38),
                         bottom: top + dpi::px(42),
                     },
                     HIT_ROW_OPEN + row_idx as u32,
@@ -546,15 +566,29 @@ fn rebuild_hits(hwnd: HWND, l: &Layout) {
             } else {
                 (
                     RECT {
-                        left: l.card.right - dpi::px(40),
+                        left: l.card.right - dpi::px(54),
                         top: top + dpi::px(10),
-                        right: l.card.right - dpi::px(20),
+                        right: l.card.right - dpi::px(34),
                         bottom: top + dpi::px(42),
                     },
                     HIT_ROW_DEL + row_idx as u32,
                 )
             };
             hits.push(Hit { rect, id });
+        }
+
+        // 滚动条命中区（整条轨道）
+        if n > vis as usize {
+            let track_x = l.card.right - dpi::px(14);
+            hits.push(Hit {
+                rect: RECT {
+                    left: track_x,
+                    top: l.card.top + dpi::px(THEAD_H),
+                    right: l.card.right,
+                    bottom: l.card.bottom,
+                },
+                id: HIT_SCROLL_TRACK,
+            });
         }
     }
 
@@ -721,9 +755,11 @@ unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
     let _ = SelectObject(hdc, old);
 
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
+    // 副标题宽度不能侵占右侧按钮区
+    let sub_w = (l.head.right - l.head.left - dpi::px(460)).max(dpi::px(200));
     draw_text(hdc, "将 Word、PowerPoint、Excel、PDF 等文档转换为 LLM 可直接读取的纯净 Markdown",
-        l.head.left, l.head.top + dpi::px(28), l.head.right - l.head.left, dpi::px(18),
-        th.slate_600, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+        l.head.left, l.head.top + dpi::px(28), sub_w, dpi::px(18),
+        th.slate_500, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
     let _ = SelectObject(hdc, old);
 
     // 三个按钮
@@ -737,12 +773,13 @@ unsafe fn draw_head(hdc: HDC, ui: &Ui, l: &Layout) {
         let is_hot = ui.hot.get() == Some(id);
         let is_clear = id == HIT_CLEAR;
         let (fg, bg) = if is_clear {
-            (if is_hot { th.red } else { th.text_mute }, if is_hot { th.red_bg } else { th.card })
+            // 设计稿：清空 = 纯文字，无边框无底色
+            (if is_hot { th.red } else { th.slate_400 }, th.card)
         } else {
             (th.slate_700, if is_hot { th.slate_100 } else { th.card })
         };
-        fill_round_rect(hdc, &h.rect, dpi::px(8), bg);
         if !is_clear {
+            fill_round_rect(hdc, &h.rect, dpi::px(8), bg);
             stroke_round_rect(hdc, &h.rect, dpi::px(8), th.border, 1);
         }
 
@@ -776,52 +813,60 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
     let _ = DeleteObject(HGDIOBJ(card.0));
 
     let hot = ui.dragging.get();
-    dashed_round_rect(hdc, &l.card, dpi::px(14), if hot { th.blue } else { th.slate_300 });
+    dashed_round_rect(hdc, &l.card, dpi::px(16), if hot { th.blue } else { th.slate_300 });
 
+    // 整块内容垂直居中（设计稿 flex-col items-center justify-center）
+    // 高度 = 图标块 56 + mb-4 16 + 主文案 20 + mb-1 4 + 副文案 16 + mb-5 20 + 标签 20
+    let box_sz = dpi::px(56);
+    let h_main = dpi::px(20);
+    let h_sub = dpi::px(16);
+    let h_tag = dpi::px(20);
+    let block_h = box_sz + dpi::px(16) + h_main + dpi::px(4) + h_sub + dpi::px(20) + h_tag;
     let cx = (l.card.left + l.card.right) / 2;
-    let cy = (l.card.top + l.card.bottom) / 2;
+    let mut y = l.card.top + ((l.card.bottom - l.card.top) - block_h) / 2;
 
     // 图标块
-    let box_sz = dpi::px(56);
     let box_rect = RECT {
         left: cx - box_sz / 2,
-        top: cy - dpi::px(78),
+        top: y,
         right: cx + box_sz / 2,
-        bottom: cy - dpi::px(78) + box_sz,
+        bottom: y + box_sz,
     };
     fill_round_rect(hdc, &box_rect, dpi::px(16), th.blue_bg);
-    draw_cloud_upload_icon(hdc, cx, box_rect.top + box_sz / 2, dpi::px(26), th.blue);
+    draw_cloud_upload_icon(hdc, cx, y + box_sz / 2, dpi::px(32), th.blue);
+    y += box_sz + dpi::px(16);
 
-    // 主文案
+    // 主文案 text-sm(14) font-semibold slate-700
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
-    let sz = measure_text(hdc, "将文档或文件夹拖入此处");
-    draw_text(hdc, "将文档或文件夹拖入此处",
-        cx - sz.cx / 2, box_rect.bottom + dpi::px(20), sz.cx + 4, dpi::px(20),
+    let t1 = "将文档或文件夹拖入此处";
+    let sz1 = measure_text(hdc, t1);
+    draw_text(hdc, t1, cx - sz1.cx / 2, y, sz1.cx + 4, h_main,
         th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
+    y += h_main + dpi::px(4);
 
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
+    // 副文案 text-xs(12) slate-400
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
     let t2 = "或者通过上方按钮浏览本地文件，支持批量队列处理";
     let sz2 = measure_text(hdc, t2);
-    draw_text(hdc, t2,
-        cx - sz2.cx / 2, box_rect.bottom + dpi::px(44), sz2.cx + 4, dpi::px(18),
+    draw_text(hdc, t2, cx - sz2.cx / 2, y, sz2.cx + 4, h_sub,
         th.text_mute, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
     let _ = SelectObject(hdc, old);
+    y += h_sub + dpi::px(20);
 
-    // 格式胶囊
+    // 格式胶囊标签
     let tags = ["DOCX", "PDF", "PPTX", "XLSX", "CSV", "EPUB", "RTF", "ODT/ODS/ODP"];
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.tag.0));
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
     let mut widths = Vec::new();
     for t in tags {
-        let s = measure_text(hdc, t);
-        widths.push(s.cx + dpi::px(14));
+        let sz = measure_text(hdc, t);
+        widths.push(sz.cx + dpi::px(16));
     }
     let gap = dpi::px(6);
     let total: i32 = widths.iter().sum::<i32>() + gap * (tags.len() as i32 - 1);
     let mut tx = cx - total / 2;
-    let ty = box_rect.bottom + dpi::px(76);
     for (i, t) in tags.iter().enumerate() {
-        let r = RECT { left: tx, top: ty, right: tx + widths[i], bottom: ty + dpi::px(19) };
+        let r = RECT { left: tx, top: y, right: tx + widths[i], bottom: y + dpi::px(20) };
         fill_round_rect(hdc, &r, dpi::px(4), th.slate_100);
         draw_text(hdc, t, r.left, r.top, r.right - r.left, r.bottom - r.top,
             th.text_dim, DRAW_TEXT_FORMAT(DT_CENTER.0), false);
@@ -865,7 +910,7 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
     draw_text(hdc, "转换状态", status_x, hy, status_w, hr.bottom - hy, th.text_dim,
         DRAW_TEXT_FORMAT(DT_LEFT.0), false);
-    draw_text(hdc, "操作", l.card.right - dpi::px(60), hy, dpi::px(44), hr.bottom - hy, th.text_dim,
+    draw_text(hdc, "操作", l.card.right - dpi::px(76), hy, dpi::px(44), hr.bottom - hy, th.text_dim,
         DRAW_TEXT_FORMAT(DT_RIGHT.0), false);
     SetTextCharacterExtra(hdc, 0);
     let _ = SelectObject(hdc, old);
@@ -1002,11 +1047,11 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         let hot_del = ui.hot.get() == Some(HIT_ROW_DEL + i as u32);
 
         if is_done {
-            draw_folder_icon(hdc, l.card.right - dpi::px(38), cy - dpi::px(8), dpi::px(16),
+            draw_folder_icon(hdc, l.card.right - dpi::px(56), cy - dpi::px(8), dpi::px(16),
                 if hot_open { th.blue } else { th.amber });
         } else {
             let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.btn.0));
-            draw_text(hdc, "✕", l.card.right - dpi::px(40), cy - dpi::px(10), dpi::px(18), dpi::px(20),
+            draw_text(hdc, "✕", l.card.right - dpi::px(54), cy - dpi::px(10), dpi::px(18), dpi::px(20),
                 if hot_del { th.red } else { th.slate_300 },
                 DRAW_TEXT_FORMAT(DT_CENTER.0), false);
             let _ = SelectObject(hdc, old);
@@ -1016,23 +1061,33 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
         hline(hdc, rr.left + dpi::px(12), rr.right - dpi::px(12), rr.bottom - 1, th.border);
     }
 
-    // 滚动条
+    // ── 滚动条（自绘，Win11 现代样式：细、无箭头、圆角滑块）──
     if tasks.len() > vis as usize {
-        let track_x = l.card.right - dpi::px(SCROLLBAR_W);
-        let track_h = l.card.bottom - l.card.top - dpi::px(THEAD_H);
-        let tb = CreateSolidBrush(th.track);
-        FillRect(hdc, &RECT { left: track_x, top: rows_top, right: l.card.right, bottom: rows_top + track_h }, tb);
-        let _ = DeleteObject(HGDIOBJ(tb.0));
+        let track_x = l.card.right - dpi::px(10);
+        let track_w = dpi::px(5);
+        let track_y = rows_top;
+        let track_h = l.card.bottom - rows_top - dpi::px(4);
+
+        // 滑块尺寸与位置
         let ratio = vis as f64 / tasks.len() as f64;
-        let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(30))).min(track_h);
+        let thumb_h = ((ratio * track_h as f64) as i32).max(dpi::px(28));
         let max_scroll = (tasks.len() as i32 - vis).max(1);
         let pos = (scroll as f64 / max_scroll as f64).clamp(0.0, 1.0);
-        let thumb_y = rows_top + ((pos * (track_h - thumb_h) as f64) as i32);
-        let color = if ui.dragging_scroll.get() { th.blue } else { th.slate_400 };
-        let thb = CreateSolidBrush(color);
-        FillRect(hdc, &RECT { left: track_x + dpi::px(2), top: thumb_y, right: l.card.right - dpi::px(2), bottom: thumb_y + thumb_h }, thb);
-        let _ = DeleteObject(HGDIOBJ(thb.0));
+        let thumb_y = track_y + ((pos * (track_h - thumb_h) as f64) as i32);
+
+        // 滑块（拖动时高亮）
+        let dragging = ui.dragging_scroll.get();
+        let hovered = ui.hot.get() == Some(HIT_SCROLL_TRACK);
+        let color = if dragging || hovered { th.slate_400 } else { th.slate_300 };
+        let rect = RECT {
+            left: track_x,
+            top: thumb_y,
+            right: track_x + track_w,
+            bottom: thumb_y + thumb_h,
+        };
+        fill_round_rect(hdc, &rect, track_w / 2, color);
     }
+
 }
 
 /// ⑤ 底部栏
@@ -1067,8 +1122,8 @@ unsafe fn draw_foot(hdc: HDC, ui: &Ui, l: &Layout) {
             .unwrap_or_else(|| "与源文件同目录".to_string())
     });
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
-    draw_folder_icon(hdc, od_x + dpi::px(8), fy - dpi::px(5), dpi::px(13), th.text_mute);
-    draw_text(hdc, &out_label, od_x + dpi::px(26), fy - dpi::px(13), od_w - dpi::px(80), dpi::px(28),
+    draw_folder_icon(hdc, od_x + dpi::px(10), fy - dpi::px(6), dpi::px(14), th.slate_400);
+    draw_text(hdc, &out_label, od_x + dpi::px(28), fy - dpi::px(13), od_w - dpi::px(82), dpi::px(28),
         th.slate_700, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
     // 「更改」
     draw_text(hdc, "更改", od_rect.right - dpi::px(38), fy - dpi::px(13), dpi::px(32), dpi::px(28),
@@ -1161,6 +1216,40 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
         }
         return;
     };
+
+    // 命中滚动条 → 按下即跳到对应位置，并开始拖动
+    if id == HIT_SCROLL_TRACK {
+        let rect = list_rect(hwnd);
+        let count = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref().map(|u| u.borrow().state.tasks.len()).unwrap_or(0)
+        }) as i32;
+        let vis = visible_rows(hwnd);
+        if count > vis {
+            let track_y = rect.top + dpi::px(THEAD_H);
+            let track_h = rect.bottom - track_y - dpi::px(4);
+            let ratio_h = vis as f64 / count as f64;
+            let thumb_h = ((ratio_h * track_h as f64) as i32).max(dpi::px(28));
+            let travel = (track_h - thumb_h).max(1);
+            let max_scroll = count - vis;
+
+            // 指针在轨道上的位置 → 目标滚动值
+            let pos = ((y - track_y - thumb_h / 2) as f64 / travel as f64).clamp(0.0, 1.0);
+            let new_scroll = (pos * max_scroll as f64).round() as i32;
+
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let mut u = ui.borrow_mut();
+                    u.dragging_scroll.set(true);
+                    u.scroll_anchor.set(y - u.scroll.get());
+                }
+            });
+            let _ = SetCapture(hwnd);
+            set_scroll(hwnd, new_scroll);
+        }
+        return;
+    }
 
     match id {
         HIT_MIN => {
@@ -1277,8 +1366,8 @@ unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) {
 
     if dragging {
         let l = compute_layout(hwnd);
-        let rows_top = l.card.top + dpi::px(THEAD_H);
-        let track_h = l.card.bottom - rows_top;
+        let track_y = l.card.top + dpi::px(THEAD_H);
+        let track_h = l.card.bottom - track_y - dpi::px(4);
         let vis = visible_rows(hwnd);
         let count = UI.with(|slot| {
             let slot = slot.borrow();
@@ -1286,7 +1375,7 @@ unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) {
         }) as i32;
         if count > vis && track_h > 0 {
             let ratio = vis as f64 / count as f64;
-            let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(30))).min(track_h);
+            let thumb_h = (((ratio * track_h as f64) as i32).max(dpi::px(28))).min(track_h);
             let max_scroll = count - vis;
             let travel = (track_h - thumb_h).max(1);
             let anchor = UI.with(|slot| {
@@ -1671,6 +1760,7 @@ fn set_scroll(hwnd: HWND, pos: i32) {
         let _ = InvalidateRect(hwnd, None, false);
     }
 }
+
 
 fn max_scroll(hwnd: HWND) -> i32 {
     let count = UI.with(|slot| {

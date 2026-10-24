@@ -203,38 +203,16 @@ pub fn stroke_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF, wi
 
 /// 虚线圆角矩形（拖放区专用）
 ///
-/// GDI 没有虚线圆角 API，这里用短直线段手工拼出圆角 + 虚线效果。
+/// 用 PS_DASH 虚线笔 + RoundRect，圆角由 GDI 正确处理，
+/// 不会出现手绘直线段在转角处错乱的问题。
 pub fn dashed_round_rect(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
     unsafe {
-        let pen = CreatePen(PS_SOLID, 1, color);
+        let pen = CreatePen(PS_DASH, 1, color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
-        let _ = old;
+        let old2: HGDIOBJ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         let r = dpi::px(radius).max(1);
-        let dash = dpi::px(8).max(2);
-        let gap = dpi::px(6).max(2);
-
-        // 直线段（虚线）
-        let mut x = rect.left;
-        while x < rect.right {
-            let x2 = (x + dash).min(rect.right);
-            MoveToEx(hdc, x, rect.top, None);
-            LineTo(hdc, x2, rect.top);
-            MoveToEx(hdc, x, rect.bottom - 1, None);
-            LineTo(hdc, x2, rect.bottom - 1);
-            x += dash + gap;
-        }
-        let mut y = rect.top;
-        while y < rect.bottom {
-            let y2 = (y + dash).min(rect.bottom);
-            MoveToEx(hdc, rect.left, y, None);
-            LineTo(hdc, rect.left, y2);
-            MoveToEx(hdc, rect.right - 1, y, None);
-            LineTo(hdc, rect.right - 1, y2);
-            y += dash + gap;
-        }
-
-        // 四个圆角用实线弧补上（用 Ellipse 裁剪不方便，改画小圆角矩形边框）
-        let _ = r;
+        RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, r, r);
+        let _ = SelectObject(hdc, old2);
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }
@@ -550,55 +528,49 @@ pub fn draw_close_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
 }
 
 
-/// 云朵上传图标（设计稿的 cloud-upload）
+/// 云朵上传图标（对齐 lucide cloud-upload）
 ///
-/// 用采样圆弧 + 折线拼出云轮廓（线性风格，和 lucide 一致），中间叠向上箭头。
+/// 单峰云 = 一个半圆 + 平底；内部叠一个向上箭头。
+/// 箭头完全落在云轮廓内，缩到 24px 也能辨认。
 pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
     unsafe {
         let pen = CreatePen(PS_SOLID, dpi::px(2), color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
 
-        let w = size as f64;
-        let h = w * 0.60;
-        let base_y = cy + (h * 0.5) as i32;
-        let mid_y = cy - (h * 0.10) as i32;
+        let r = (size as f64 * 0.34).round() as i32;   // 云的半径
+        let base_y = cy + r / 2;                       // 云底
+        let ccy = base_y - r / 3;                      // 圆心略高于底
 
-        // 三段圆弧采样：(中心x, 中心y, 半径, 起始角, 结束角)
-        let arcs: [(f64, f64, f64, f64, f64); 3] = [
-            (cx as f64 - w * 0.30, mid_y as f64, h * 0.42, 100.0, 260.0),
-            (cx as f64 - w * 0.04, mid_y as f64 - h * 0.22, h * 0.52, 190.0, 350.0),
-            (cx as f64 + w * 0.26, mid_y as f64, h * 0.40, 280.0, 440.0),
-        ];
-
+        // 半圆 + 平底
         let mut pts: Vec<POINT> = Vec::new();
-        for (ccx, ccy, r, a0, a1) in arcs {
-            let steps = 10;
-            for i in 0..=steps {
-                let t = a0 + (a1 - a0) * (i as f64 / steps as f64);
-                let rad = t * std::f64::consts::PI / 180.0;
-                pts.push(POINT {
-                    x: (ccx + r * rad.cos()) as i32,
-                    y: (ccy + r * rad.sin()) as i32,
-                });
-            }
+        let steps = 16;
+        for k in 0..=steps {
+            let t = 180.0 + 180.0 * (k as f64 / steps as f64);
+            let rad = t * std::f64::consts::PI / 180.0;
+            pts.push(POINT {
+                x: cx + (r as f64 * rad.cos()) as i32,
+                y: ccy + (r as f64 * rad.sin()) as i32,
+            });
         }
-        // 底边两个端点
-        pts.push(POINT { x: cx + (w * 0.40) as i32, y: base_y });
-        pts.push(POINT { x: cx - (w * 0.40) as i32, y: base_y });
-
-        if !pts.is_empty() {
+        // 底边两端封口
+        if let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) {
+            pts.push(POINT { x: last.x, y: base_y });
+            pts.push(POINT { x: first.x, y: base_y });
+            pts.push(first);
+        }
+        if pts.len() > 1 {
             Polyline(hdc, &pts);
         }
 
-        // 中间向上箭头
+        // 向上箭头（完全在云内）
         let ax = cx;
-        let ay_top = mid_y - (h * 0.30) as i32;
-        let ay_bot = base_y - dpi::px(2);
+        let ay_top = ccy - r / 2;
+        let ay_bot = base_y - r / 4;
         MoveToEx(hdc, ax, ay_top, None);
         LineTo(hdc, ax, ay_bot);
-        MoveToEx(hdc, ax - dpi::px(4), ay_top + dpi::px(5), None);
+        MoveToEx(hdc, ax - r / 3, ay_top + r / 4, None);
         LineTo(hdc, ax, ay_top);
-        LineTo(hdc, ax + dpi::px(4), ay_top + dpi::px(5));
+        LineTo(hdc, ax + r / 3, ay_top + r / 4);
 
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));
