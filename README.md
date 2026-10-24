@@ -31,7 +31,7 @@ Releases 页只有一个包：
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| [`AnyDoc-v0.5.2-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.2/AnyDoc-v0.5.2-win-x64-portable.zip) | 3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
+| [`AnyDoc-v0.5.3-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.2/AnyDoc-v0.5.3-win-x64-portable.zip) | 3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
 
 > 解压后目录结构要保留（`resources/` 里是图标资源）。
 > 已用 SHA256 自签名 + DigiCert 时间戳签名。
@@ -106,6 +106,7 @@ anydoc 读取文件签名（PDF header、RTF open group、OLE stream name、ZIP 
 
 | 版本 | 改动 |
 |------|------|
+| **v0.5.3** | **修复窗口无法最大化 / 关闭按钮点不动**：滚动条的点击热区没限制 y 坐标，把标题栏的「最大化 / 关闭」按钮一起吞了；最大化后客户区没重算；最大化位置改成相对显示器（多显示器不再飞出屏幕） |
 | **v0.5.2** | 修复最大化后右侧窗口按钮被切掉；重画云上传图标；**修正字体字号**（实际渲染比设计稿小一圈）；还原图标重画 |
 | **v0.5.1** | 修复点行尾 📂 被误判成删除（行会被删掉而不是打开文件夹）；打开失败自动兜底打开父目录 |
 | **v0.5.0** | 界面按设计稿精确还原：无边框窗口（消掉顶部空白带）、表格改 `grid-cols-12 gap-4` 栅格、行内进度条与阶段文字连成一体、删掉底部多余的总进度条、头部按钮按内容排版并补上垃圾桶图标、输出目录框重排 |

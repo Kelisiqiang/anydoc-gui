@@ -190,16 +190,22 @@ pub unsafe extern "system" fn wnd_proc(
                 if is_maximized(hwnd) {
                     // 最大化时窗口会比工作区多出隐形的缩放边框（Win10/11 每边约 8px），
                     // 客户区若铺满整个窗口，右侧的窗口按钮会被挤出屏幕看不见。
-                    // 这里把客户区收回到「工作区 ∩ 窗口矩形」：
-                    // 真实 Windows 上等于工作区（按钮不被切），
-                    // 窗口没被真正拉大的环境下退化成窗口矩形（不画歪）。
-                    let mut r = work_area(hwnd);
-                    let win = pnc.rgrc[1];
-                    r.left = r.left.max(win.left);
-                    r.top = r.top.max(win.top);
-                    r.right = r.right.min(win.right);
-                    r.bottom = r.bottom.min(win.bottom);
-                    pnc.rgrc[0] = r;
+                    // 这里按系统边框宽度把客户区往里收，用的是「相对窗口矩形」的偏移，
+                    // 不牵扯屏幕/窗口两套坐标系，最稳。
+                    let fx = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    let fy = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    let w = pnc.rgrc[1];
+                    let c = RECT {
+                        left: w.left + fx,
+                        top: w.top + fy,
+                        right: w.right - fx,
+                        bottom: w.bottom - fy,
+                    };
+                    if c.right > c.left && c.bottom > c.top {
+                        pnc.rgrc[0] = c;
+                    } else {
+                        pnc.rgrc[0] = pnc.rgrc[1];
+                    }
                 } else {
                     pnc.rgrc[0] = pnc.rgrc[1];
                 }
@@ -311,8 +317,10 @@ pub unsafe extern "system" fn wnd_proc(
             // 这里把最大尺寸限制在「工作区」范围内。
             let mmi = &mut *(lp.0 as *mut MINMAXINFO);
             let work = work_area(hwnd);
-            mmi.ptMaxPosition.x = work.left;
-            mmi.ptMaxPosition.y = work.top;
+            // ptMaxPosition 是相对「显示器」的，不能用工作区坐标，
+            // 否则多显示器时窗口会跑到屏幕外面去（最大化就废了）
+            mmi.ptMaxPosition.x = 0;
+            mmi.ptMaxPosition.y = 0;
             mmi.ptMaxSize.x = work.right - work.left;
             mmi.ptMaxSize.y = work.bottom - work.top;
             mmi.ptMaxTrackSize.x = work.right - work.left;
@@ -1431,7 +1439,14 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
     let l = compute_layout(hwnd);
 
     // 滚动条拖动
-    if x >= l.card.right - dpi::px(SCROLLBAR_W) && x <= l.card.right {
+    // 注意：必须限制在列表区域内。否则最右边那条 16px 会把标题栏的
+    // 「最大化 / 关闭」按钮一起吞掉（点它们变成拖滚动条，按钮永远不响应）。
+    let rows_top = l.card.top + dpi::px(THEAD_H);
+    if x >= l.card.right - dpi::px(SCROLLBAR_W)
+        && x <= l.card.right
+        && y >= rows_top
+        && y <= l.card.bottom
+    {
         UI.with(|slot| {
             let slot = slot.borrow();
             if let Some(ui) = slot.as_ref() {
@@ -1510,6 +1525,17 @@ unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
         HIT_MAX => {
             let maximized = is_maximized(hwnd);
             let _ = ShowWindow(hwnd, if maximized { SW_RESTORE } else { SW_MAXIMIZE });
+            // 强制重算一次客户区：部分系统最大化时不会重发 WM_NCCALCSIZE，
+            // 客户区会停在旧尺寸（窗口变大了但内容还是老宽度）。
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
             layout(hwnd);
             let _ = InvalidateRect(hwnd, None, true);
         }
