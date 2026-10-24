@@ -137,6 +137,9 @@ pub struct Fonts {
     pub name: HFONT,      // 12 文件名 (text-xs)
     pub meta: HFONT,      // 12 次要信息 (text-xs)
     pub tag: HFONT,       // 10 徽章 (text-[10px])
+    pub mono_tag: HFONT,  // 10 扩展名徽章 (mono text-[10px])
+    pub mono_small: HFONT,// 11 空态格式标签 (mono text-[11px])
+    pub empty_title: HFONT, // 14 空态主文案 (text-sm font-semibold)
     pub foot: HFONT,      // 12 底栏 (text-xs)
     pub big: HFONT,       // 14 大按钮
 }
@@ -146,8 +149,10 @@ pub fn make_mono(px: i32, weight: i32) -> HFONT {
     unsafe {
         let face = mono_family().to_string();
         let face: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
+        // 高度必须是负数：负数 = 字面高度（em），正数 = 行高（会按行高反推字号，
+        // 中文雅黑的行高比字面高 1.3 倍左右，传正数会让字比设计稿小一圈）
         CreateFontW(
-            dpi::font_px(px), 0, 0, 0, weight, 0, 0, 0,
+            -dpi::font_px(px), 0, 0, 0, weight, 0, 0, 0,
             DEFAULT_CHARSET.0 as u32,
             OUT_DEFAULT_PRECIS.0 as u32,
             CLIP_DEFAULT_PRECIS.0 as u32,
@@ -163,8 +168,9 @@ pub fn make_font(px: i32, weight: i32) -> HFONT {
     unsafe {
         let face = ui_family().to_string();
         let face: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
+        // 负高度 = 字面高度，这样 12px 就是真的 12px
         CreateFontW(
-            dpi::font_px(px),
+            -dpi::font_px(px),
             0, 0, 0, weight, 0, 0, 0,
             DEFAULT_CHARSET.0 as u32,
             OUT_DEFAULT_PRECIS.0 as u32,
@@ -364,11 +370,27 @@ pub fn draw_text(
     unsafe {
         SetTextColor(hdc, color);
         SetBkMode(hdc, TRANSPARENT);
-        let mut rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        let mut buf: Vec<u16> = text.encode_utf16().collect();
+        // 字体行高可能超过给定的高度（微软雅黑的行高本来就比字号大），
+        // 直接画会被裁掉上下缘。这里按需把矩形上下撑开，保证字形完整。
+        let mut need = RECT::default();
+        let _ = DrawTextW(
+            hdc,
+            &mut buf,
+            &mut need,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let need_h = need.bottom - need.top;
+        let (mut ry, mut rh) = (y, h);
+        if need_h > h {
+            let extra = (need_h - h) / 2;
+            ry -= extra;
+            rh += extra * 2;
+        }
+        let mut rc = RECT { left: x, top: ry, right: x + w, bottom: ry + rh };
         let flags = DT_SINGLELINE | DT_VCENTER | align
             | if clip { DT_END_ELLIPSIS } else { DRAW_TEXT_FORMAT(0) };
-        let mut buf: Vec<u16> = text.encode_utf16().collect();
-        DrawTextW(hdc, &mut buf, &mut rc, flags);
+        let _ = DrawTextW(hdc, &mut buf, &mut rc, flags);
         // 宽度单独测量：DrawTextW 对不同对齐方式修改 rc 的行为不一致，
         // 直接用返回值会导致后续元素位置算错。
         measure_text(hdc, text).cx
@@ -726,15 +748,17 @@ pub fn draw_restore_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF)
         let pen = CreatePen(PS_SOLID, dpi::px(1), color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
         let h = size / 2;
-        let o = dpi::px(3);
-        // 后层
-        MoveToEx(hdc, cx - h + o, cy - h + o, None);
-        LineTo(hdc, cx + h + o, cy - h + o);
-        LineTo(hdc, cx + h + o, cy + h);
-        // 前层
+        let o = (size / 3).max(2);
+        // 后层方框（左上）：上边 + 左边 + 右边（到前层为止）
         MoveToEx(hdc, cx - h, cy - h + o, None);
-        LineTo(hdc, cx - h, cy + h + o);
-        LineTo(hdc, cx + h - o, cy + h + o);
+        LineTo(hdc, cx - h, cy - h);
+        LineTo(hdc, cx + h - o, cy - h);
+        LineTo(hdc, cx + h - o, cy + h - o);
+        // 前层方框（右下）：左边 + 下边 + 右边
+        MoveToEx(hdc, cx - h + o, cy - h + o, None);
+        LineTo(hdc, cx - h + o, cy + h);
+        LineTo(hdc, cx + h, cy + h);
+        LineTo(hdc, cx + h, cy - h + o);
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }
@@ -758,47 +782,57 @@ pub fn draw_close_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
 
 /// 云朵上传图标（对齐 lucide cloud-upload）
 ///
-/// 单峰云 = 一个半圆 + 平底；内部叠一个向上箭头。
-/// 箭头完全落在云轮廓内，缩到 24px 也能辨认。
+/// 24×24 网格：云轮廓 + 向上的箭头（箭杆穿过云底，和 lucide 一致）。
+/// 之前那版是「半圆 + 平底」，缩到 24px 就糊成一坨，这里改成完整云形。
 pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
     unsafe {
-        let pen = CreatePen(PS_SOLID, dpi::px(2), color);
+        let f = size as f64 / 24.0;
+        let pen = CreatePen(PS_SOLID, ((size as f64 * 2.0 / 24.0).round() as i32).max(1), color);
         let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(pen.0));
+        let p = |x: f64, y: f64| -> POINT {
+            POINT {
+                x: cx + ((x - 12.0) * f).round() as i32,
+                y: cy + ((y - 12.0) * f).round() as i32,
+            }
+        };
 
-        let r = (size as f64 * 0.34).round() as i32;   // 云的半径
-        let base_y = cy + r / 2;                       // 云底
-        let ccy = base_y - r / 3;                      // 圆心略高于底
+        // 云轮廓（底部平线，右侧回到起点）
+        let cloud: [(f64, f64); 10] = [
+            (4.6, 18.0),  // 左下
+            (3.2, 14.6),
+            (4.6, 11.2),
+            (7.6, 8.9),
+            (10.6, 8.0),
+            (13.4, 6.1),  // 顶部
+            (16.4, 8.0),
+            (19.4, 10.6),
+            (20.8, 14.0),
+            (19.6, 18.0), // 右下
+        ];
+        for (i, q) in cloud.iter().enumerate() {
+            let pt = p(q.0, q.1);
+            if i == 0 {
+                MoveToEx(hdc, pt.x, pt.y, None);
+            } else {
+                LineTo(hdc, pt.x, pt.y);
+            }
+        }
+        // 底边
+        let last = p(cloud[cloud.len() - 1].0, cloud[cloud.len() - 1].1);
+        let first = p(cloud[0].0, cloud[0].1);
+        LineTo(hdc, first.x, first.y);
 
-        // 半圆 + 平底
-        let mut pts: Vec<POINT> = Vec::new();
-        let steps = 16;
-        for k in 0..=steps {
-            let t = 180.0 + 180.0 * (k as f64 / steps as f64);
-            let rad = t * std::f64::consts::PI / 180.0;
-            pts.push(POINT {
-                x: cx + (r as f64 * rad.cos()) as i32,
-                y: ccy + (r as f64 * rad.sin()) as i32,
-            });
-        }
-        // 底边两端封口
-        if let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) {
-            pts.push(POINT { x: last.x, y: base_y });
-            pts.push(POINT { x: first.x, y: base_y });
-            pts.push(first);
-        }
-        if pts.len() > 1 {
-            Polyline(hdc, &pts);
-        }
-
-        // 向上箭头（完全在云内）
-        let ax = cx;
-        let ay_top = ccy - r / 2;
-        let ay_bot = base_y - r / 4;
-        MoveToEx(hdc, ax, ay_top, None);
-        LineTo(hdc, ax, ay_bot);
-        MoveToEx(hdc, ax - r / 3, ay_top + r / 4, None);
-        LineTo(hdc, ax, ay_top);
-        LineTo(hdc, ax + r / 3, ay_top + r / 4);
+        // 箭头：头部 V 形 + 竖杆（竖杆穿过云底）
+        let a1 = p(8.6, 12.4);
+        let a2 = p(12.0, 9.0);
+        let a3 = p(15.4, 12.4);
+        MoveToEx(hdc, a1.x, a1.y, None);
+        LineTo(hdc, a2.x, a2.y);
+        LineTo(hdc, a3.x, a3.y);
+        let s1 = p(12.0, 10.4);
+        let s2 = p(12.0, 20.6);
+        MoveToEx(hdc, s1.x, s1.y, None);
+        LineTo(hdc, s2.x, s2.y);
 
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));

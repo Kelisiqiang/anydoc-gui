@@ -187,7 +187,22 @@ pub unsafe extern "system" fn wnd_proc(
         WM_NCCALCSIZE => {
             if wp.0 != 0 {
                 let pnc = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
-                pnc.rgrc[0] = pnc.rgrc[1];
+                if is_maximized(hwnd) {
+                    // 最大化时窗口会比工作区多出隐形的缩放边框（Win10/11 每边约 8px），
+                    // 客户区若铺满整个窗口，右侧的窗口按钮会被挤出屏幕看不见。
+                    // 这里把客户区收回到「工作区 ∩ 窗口矩形」：
+                    // 真实 Windows 上等于工作区（按钮不被切），
+                    // 窗口没被真正拉大的环境下退化成窗口矩形（不画歪）。
+                    let mut r = work_area(hwnd);
+                    let win = pnc.rgrc[1];
+                    r.left = r.left.max(win.left);
+                    r.top = r.top.max(win.top);
+                    r.right = r.right.min(win.right);
+                    r.bottom = r.bottom.min(win.bottom);
+                    pnc.rgrc[0] = r;
+                } else {
+                    pnc.rgrc[0] = pnc.rgrc[1];
+                }
             }
             LRESULT(0)
         }
@@ -295,15 +310,9 @@ pub unsafe extern "system" fn wnd_proc(
             // WS_POPUP 最大化会铺满整个屏幕（含任务栏），
             // 这里把最大尺寸限制在「工作区」范围内。
             let mmi = &mut *(lp.0 as *mut MINMAXINFO);
-            let mut work = RECT::default();
-            let _ = SystemParametersInfoW(
-                SPI_GETWORKAREA,
-                0,
-                Some(&mut work as *mut RECT as *mut std::ffi::c_void),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            );
-            mmi.ptMaxPosition.x = 0;
-            mmi.ptMaxPosition.y = 0;
+            let work = work_area(hwnd);
+            mmi.ptMaxPosition.x = work.left;
+            mmi.ptMaxPosition.y = work.top;
             mmi.ptMaxSize.x = work.right - work.left;
             mmi.ptMaxSize.y = work.bottom - work.top;
             mmi.ptMaxTrackSize.x = work.right - work.left;
@@ -396,6 +405,9 @@ fn make_fonts() -> Fonts {
         name: make_font(12, 600),
         meta: make_font(12, 500),
         tag: make_font(10, 600),
+        mono_tag: make_mono(10, 600),
+        mono_small: make_mono(11, 500),
+        empty_title: make_font(14, 600),
         foot: make_font(12, 500),
         big: make_font(14, 700),
     }
@@ -961,7 +973,7 @@ unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
             HIT_MIN => draw_min_icon(hdc, cx, cy, dpi::px(12), color),
             HIT_MAX => {
                 if maximized {
-                    draw_restore_icon(hdc, cx, cy, dpi::px(11), color);
+                    draw_restore_icon(hdc, cx, cy, dpi::px(13), color);
                 } else {
                     draw_max_icon(hdc, cx, cy, dpi::px(10), color);
                 }
@@ -974,22 +986,26 @@ unsafe fn draw_brand(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
 /// ② 头部（大标题 + 副标题 + 操作按钮）
 unsafe fn draw_head(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
     let th = &ui.theme;
+    let btns = compute_head_buttons(hwnd, l);
 
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.h1.0));
+    // 设计稿大标题是 tracking-tight（-0.025em），字距收紧一点更接近
+    SetTextCharacterExtra(hdc, -dpi::px(1));
     draw_text(hdc, "文档转 Markdown", l.head.left, l.head.top, dpi::px(400), dpi::px(28),
         th.slate_800, DRAW_TEXT_FORMAT(DT_LEFT.0), false);
+    SetTextCharacterExtra(hdc, 0);
     let _ = SelectObject(hdc, old);
 
     let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
-    // 副标题宽度不能侵占右侧按钮区
-    let sub_w = (l.head.right - l.head.left - dpi::px(460)).max(dpi::px(200));
+    // 副标题不能压到右侧按钮组：可用宽度 = 按钮组左边缘 - 标题左边距
+    let btn_left = btns.first().map(|b| b.rect.left).unwrap_or(l.head.right);
+    let sub_w = (btn_left - l.head.left - dpi::px(12)).max(dpi::px(200));
     draw_text(hdc, "将 Word、PowerPoint、Excel、PDF 等文档转换为 LLM 可直接读取的纯净 Markdown",
         l.head.left, l.head.top + dpi::px(28), sub_w, dpi::px(18),
         th.slate_500, DRAW_TEXT_FORMAT(DT_LEFT.0), true);
     let _ = SelectObject(hdc, old);
 
     // 三个按钮
-    let btns = compute_head_buttons(hwnd, l);
     for b in &btns {
         let is_hot = ui.hot.get() == Some(b.id);
         let is_clear = b.icon == 2;
@@ -1062,7 +1078,7 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
     y += box_sz + dpi::px(16);
 
     // 主文案 text-sm(14) font-semibold slate-700
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.name.0));
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.empty_title.0));
     let t1 = "将文档或文件夹拖入此处";
     let sz1 = measure_text(hdc, t1);
     draw_text(hdc, t1, cx - sz1.cx / 2, y, sz1.cx + 4, h_main,
@@ -1071,7 +1087,7 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
     y += h_main + dpi::px(4);
 
     // 副文案 text-xs(12) slate-400
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.sub.0));
     let t2 = "或者通过上方按钮浏览本地文件，支持批量队列处理";
     let sz2 = measure_text(hdc, t2);
     draw_text(hdc, t2, cx - sz2.cx / 2, y, sz2.cx + 4, h_sub,
@@ -1079,9 +1095,9 @@ unsafe fn draw_empty(hdc: HDC, ui: &Ui, l: &Layout) {
     let _ = SelectObject(hdc, old);
     y += h_sub + dpi::px(20);
 
-    // 格式胶囊标签
+    // 格式胶囊标签（text-[11px] font-mono）
     let tags = ["DOCX", "PDF", "PPTX", "XLSX", "CSV", "EPUB", "RTF", "ODT/ODS/ODP"];
-    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
+    let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono_small.0));
     let mut widths = Vec::new();
     for t in tags {
         let sz = measure_text(hdc, t);
@@ -1168,11 +1184,11 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
 
         let cy = top + row_h / 2;
 
-        // 扩展名徽章
+        // 扩展名徽章（text-[10px] font-mono font-semibold）
         let (fg, bgc, bd) = ext_style(th, &task.ext);
-        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono.0));
+        let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.mono_tag.0));
         let tag = task.ext.to_uppercase();
-        let tw = draw_pill(hdc, &tag, cols.name_x, cy, fg, bgc, ui.fonts.mono, bd);
+        let tw = draw_pill(hdc, &tag, cols.name_x, cy, fg, bgc, ui.fonts.mono_tag, bd);
         let _ = SelectObject(hdc, old);
 
         // 文件名
@@ -1201,7 +1217,7 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
                 // 用不确定态动画表示「正在进行」，而不是卡在一个数字上。
                 let indeterminate = task.phase == "解析转换";
 
-                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
+                let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
                 let phase_w = if indeterminate { inner_w } else { inner_w - dpi::px(44) };
                 draw_text(hdc, &phase, inner_x, cy - dpi::px(15),
                     phase_w, dpi::px(16), th.blue,
@@ -2136,11 +2152,16 @@ pub unsafe fn preload_folder(hwnd: HWND, dir: &PathBuf) {
 
 
 
-/// 窗口是否最大化
-unsafe fn is_maximized(hwnd: HWND) -> bool {
-    let mut rc = RECT::default();
-    let _ = GetWindowRect(hwnd, &mut rc);
-    // 最大化时窗口 rect 等于工作区
+/// 窗口所在显示器的工作区（屏幕坐标）
+unsafe fn work_area(hwnd: HWND) -> RECT {
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(mon, &mut mi).as_bool() && mi.rcWork.right > mi.rcWork.left {
+        return mi.rcWork;
+    }
     let mut work = RECT::default();
     let _ = SystemParametersInfoW(
         SPI_GETWORKAREA,
@@ -2148,8 +2169,21 @@ unsafe fn is_maximized(hwnd: HWND) -> bool {
         Some(&mut work as *mut RECT as *mut std::ffi::c_void),
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
     );
-    (rc.right - rc.left) >= (work.right - work.left)
-        && (rc.bottom - rc.top) >= (work.bottom - work.top)
+    if work.right > work.left {
+        return work;
+    }
+    // 兜底：整块屏幕
+    RECT {
+        left: 0,
+        top: 0,
+        right: GetSystemMetrics(SM_CXSCREEN),
+        bottom: GetSystemMetrics(SM_CYSCREEN),
+    }
+}
+
+/// 窗口是否最大化
+unsafe fn is_maximized(hwnd: HWND) -> bool {
+    IsZoomed(hwnd).as_bool()
 }
 
 
