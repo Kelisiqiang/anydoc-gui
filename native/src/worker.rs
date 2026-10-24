@@ -122,28 +122,89 @@ fn write_with_progress(
     Ok(())
 }
 
+/// 把内核错误码翻译成用户能懂的话
+fn map_error(e: anydoc::ConvertError) -> String {
+    match e {
+        anydoc::ConvertError::NeedsOcr { .. } => "需 OCR（本地不含 OCR）".to_string(),
+        anydoc::ConvertError::Encrypted => "文件已加密".to_string(),
+        anydoc::ConvertError::Malformed { .. } => "文件结构损坏".to_string(),
+        anydoc::ConvertError::ResourceLimit { .. } => "超出安全限制".to_string(),
+        anydoc::ConvertError::MissingPart { .. } => "缺少必要内容".to_string(),
+        anydoc::ConvertError::Unsupported(_) => "不支持的格式".to_string(),
+        anydoc::ConvertError::Io(_) => "文件读取失败".to_string(),
+        other => format!("转换失败: {}", other),
+    }
+}
+
+/// 问用户：这份扫描件要不要走云端 OCR
+///
+/// 官方 anydoc 本地不做 OCR（遇到扫描页直接报 needsOcr），
+/// 官方给的解法是 `--ocr hosted` —— 把文档交给 Firecrawl Parse 云端处理。
+/// 这里保持同样的语义：先问，用户同意才上传。
+fn ask_cloud_ocr(
+    task: &Task,
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+    allow_all: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if allow_all.load(Ordering::Relaxed) {
+        return true;
+    }
+    let _ = tx.send(WorkerMsg::NeedsOcrPrompt {
+        id: task.id,
+        name: task.name.clone(),
+        size: task.size,
+    });
+    let (lock, cv) = &*task.ocr_decision;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (g, _) = cv
+        .wait_timeout(guard, std::time::Duration::from_secs(300))
+        .unwrap_or_else(|e| e.into_inner());
+    *g
+}
+
 /// 调用官方内核转换
+///
+/// 返回 (Markdown, 是否走云端 OCR)
 fn parse_bytes(
     task: &Task,
     bytes: &[u8],
-) -> Result<String, String> {
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+    allow_all: &std::sync::atomic::AtomicBool,
+) -> Result<(String, bool), String> {
     // 字节签名识别格式，改过扩展名的文件也能正确解析
     let format = anydoc::Format::from_bytes(bytes)
         .or_else(|| anydoc::Format::from_extension(&task.ext));
 
-    let md = anydoc::to_markdown_bytes(bytes, format).map_err(|e| {
-        // 把内部错误码翻译成用户能懂的话
-        match e {
-            anydoc::ConvertError::NeedsOcr { .. } => "需 OCR（anydoc 不含 OCR）".to_string(),
-            anydoc::ConvertError::Encrypted => "文件已加密".to_string(),
-            anydoc::ConvertError::Malformed { .. } => "文件结构损坏".to_string(),
-            anydoc::ConvertError::ResourceLimit { .. } => "超出安全限制".to_string(),
-            anydoc::ConvertError::MissingPart { .. } => "缺少必要内容".to_string(),
-            anydoc::ConvertError::Unsupported(_) => "不支持的格式".to_string(),
-            anydoc::ConvertError::Io(_) => "文件读取失败".to_string(),
-            other => format!("转换失败: {}", other),
+    let md = match anydoc::to_markdown_bytes(bytes, format) {
+        Ok(m) => (m, false),
+        Err(anydoc::ConvertError::NeedsOcr { .. }) => {
+            // 本地没有 OCR 能力，交给云端（和官方 --ocr hosted 一个路子）
+            if task.ext != "pdf" {
+                return Err("需 OCR（该格式不支持云端 OCR）".to_string());
+            }
+            if !ask_cloud_ocr(task, tx, allow_all) {
+                return Err("需 OCR（已跳过）".to_string());
+            }
+            if task.is_cancelled() {
+                return Err(CANCELLED.to_string());
+            }
+            let _ = tx.send(WorkerMsg::Progress {
+                id: task.id,
+                percent: 40,
+                phase: "云端 OCR".to_string(),
+            });
+            let md = match crate::ocr::hosted_markdown(bytes, &task.name) {
+                Ok(m) => m,
+                Err(e) => {
+                    crate::ui::diag(&format!("云端 OCR 失败: {e}"));
+                    return Err(e);
+                }
+            };
+            (md, true)
         }
-    })?;
+        Err(e) => return Err(map_error(e)),
+    };
     Ok(md)
 }
 
@@ -154,6 +215,8 @@ pub fn spawn(
     tasks: Vec<Task>,
     out_root: Option<PathBuf>,
     inject_frontmatter: bool,
+    // 用户是否同意「本次所有扫描件都走云端 OCR」
+    allow_all: Arc<std::sync::atomic::AtomicBool>,
 ) -> Receiver<WorkerMsg> {
     let out_root: Arc<Option<PathBuf>> = Arc::new(out_root);
     let (tx, rx) = channel::<WorkerMsg>();
@@ -174,6 +237,7 @@ pub fn spawn(
         let done_count = done_count.clone();
         let out_root = out_root.clone();
         let inject_frontmatter = inject_frontmatter;
+        let allow_all = allow_all.clone();
 
         thread::spawn(move || {
             loop {
@@ -209,7 +273,7 @@ pub fn spawn(
                 let _ = tx.send(WorkerMsg::Started { id: task.id });
 
                 let t_start = std::time::Instant::now();
-                let result = process(&task, &out_root, inject_frontmatter, &tx);
+                let result = process(&task, &out_root, inject_frontmatter, &tx, &allow_all);
 
                 let elapsed_ms = t_start.elapsed().as_millis() as u64;
                 if tx
@@ -240,7 +304,8 @@ fn process(
     out_root: &PathBuf,
     inject_frontmatter: bool,
     tx: &std::sync::mpsc::Sender<WorkerMsg>,
-) -> Result<(u64, String), String> {
+    allow_all: &std::sync::atomic::AtomicBool,
+) -> Result<(u64, String, bool), String> {
     // ① 读取（真实字节进度）
     let bytes = read_with_progress(&task.path, task.size, tx, task)?;
 
@@ -249,7 +314,7 @@ fn process(
     }
 
     // ② 解析（官方内核，一次性；进度停在 30%→95%）
-    let md = parse_bytes(task, &bytes)?;
+    let (md, via_cloud) = parse_bytes(task, &bytes, tx, allow_all)?;
 
     if task.is_cancelled() {
         return Err(CANCELLED.to_string());
@@ -267,5 +332,5 @@ fn process(
     let out_path = task.output_path(out_root);
     write_with_progress(&out_path, md.as_bytes(), tx, task)?;
 
-    Ok((size, md))
+    Ok((size, md, via_cloud))
 }

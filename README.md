@@ -31,7 +31,7 @@ Releases 页只有一个包：
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| [`AnyDoc-v0.5.4-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.4/AnyDoc-v0.5.4-win-x64-portable.zip) | 3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
+| [`AnyDoc-v0.5.5-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.5/AnyDoc-v0.5.5-win-x64-portable.zip) | 4.4MB | **免安装版**：解压即用，不需要装任何运行时 |
 
 > 解压后目录结构要保留（`resources/` 里是图标资源）。
 > 已用 SHA256 自签名 + DigiCert 时间戳签名。
@@ -106,6 +106,7 @@ anydoc 读取文件签名（PDF header、RTF open group、OLE stream name、ZIP 
 
 | 版本 | 改动 |
 |------|------|
+| **v0.5.5** | **扫描件（图片版 PDF）也能转了**：官方 anydoc 内核本地不含 OCR，遇到扫描页会整份报 `needsOcr`（官方 CLI 同样如此，要加 `--ocr hosted`）。本版把官方的「云端 OCR」通路接了进来：遇到扫描页弹窗问你要不要用云端 OCR（Firecrawl Parse），同意后自动上传转换，状态标「云端」；不联网时其余格式照常 |
 | **v0.5.4** | **修最大化黑屏**：客户区计算改成用 `WINDOWPOS` 的窗口矩形（不再混用屏幕/窗口两套坐标），最大化时客户区 = 工作区 ∩ 窗口矩形；位图建不出来时不再往窗口里塞 NULL（那会导致整个界面画不出来 = 黑屏），改为直接往窗口 DC 绘制；客户区异常时先夹紧再画；新增 `anydoc-diag.log` 诊断日志与崩溃自动记录 |
 | **v0.5.3** | **修复窗口无法最大化 / 关闭按钮点不动**：滚动条的点击热区没限制 y 坐标，把标题栏的「最大化 / 关闭」按钮一起吞了；最大化后客户区没重算；最大化位置改成相对显示器（多显示器不再飞出屏幕） |
 | **v0.5.2** | 修复最大化后右侧窗口按钮被切掉；重画云上传图标；**修正字体字号**（实际渲染比设计稿小一圈）；还原图标重画 |
@@ -113,6 +114,25 @@ anydoc 读取文件签名（PDF header、RTF open group、OLE stream name、ZIP 
 | **v0.5.0** | 界面按设计稿精确还原：无边框窗口（消掉顶部空白带）、表格改 `grid-cols-12 gap-4` 栅格、行内进度条与阶段文字连成一体、删掉底部多余的总进度条、头部按钮按内容排版并补上垃圾桶图标、输出目录框重排 |
 | v0.4.4 | 解决 Windows SmartScreen 弹窗（包内附 `首次运行.bat`） |
 | v0.3.0 | 改成原生 Windows 窗口，移除安装包与网页版 |
+
+---
+
+## 扫描件 / 图片版 PDF
+
+官方 anydoc 的 PDF 内核（pdf-inspector）**本地不做 OCR**，只要有一页是扫描图，
+整份文档就报 `needsOcr`（官方 CLI 不加 `--ocr hosted` 也是一样）。
+
+本版接了官方的云端 OCR 通路：转换时遇到扫描页会弹窗问你
+
+- **是** = 本次所有扫描件都用云端 OCR
+- **否** = 只有这一个用
+- **取消** = 跳过（该文件保持失败）
+
+同意后文档会发到 **Firecrawl Parse**（`api.firecrawl.dev/v2/parse`）做识别，
+**不需要注册就能用**（额度有限；设环境变量 `FIRECRAWL_API_KEY` 可提高额度）。
+转好的文件状态会标「云端」，方便区分。
+
+> 不想把文档发到云端就别点「是」——本地转换的其它格式完全不受影响。
 
 ---
 

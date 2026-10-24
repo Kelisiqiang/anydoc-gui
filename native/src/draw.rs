@@ -460,7 +460,7 @@ pub fn status_style(theme: &Theme, status: &Status) -> (String, COLORREF, COLORR
         }
         Status::Error(e) => {
             let short = match e.as_str() {
-                "需 OCR（anydoc 不含 OCR）" => "需 OCR".to_string(),
+                "需 OCR（本地不含 OCR）" | "需 OCR（已跳过）" | "需 OCR（该格式不支持云端 OCR）" => "需 OCR".to_string(),
                 "文件已加密" => "已加密".to_string(),
                 "文件结构损坏" => "文件损坏".to_string(),
                 "超出安全限制" => "超出限制".to_string(),

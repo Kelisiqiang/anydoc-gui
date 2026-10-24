@@ -86,6 +86,8 @@ pub struct Ui {
     pub app_icon: Option<HICON>,
     /// 注入 YAML Frontmatter
     pub inject_frontmatter: Cell<bool>,
+    /// 用户是否同意「本次所有扫描件都走云端 OCR」（与 worker 线程共享）
+    pub ocr_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 thread_local! {
@@ -405,6 +407,7 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         hits: RefCell::new(Vec::new()),
         app_icon,
         inject_frontmatter: Cell::new(true),
+        ocr_allow_all: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }));
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
@@ -1428,7 +1431,11 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
                 }
             }
             Status::Done(_) | Status::Error(_) | Status::Wait => {
-                let (text, fg, bgc, _) = status_style(th, &task.status);
+                let (mut text, fg, bgc, _) = status_style(th, &task.status);
+                // 云端 OCR 转换的，标一下
+                if task.via_cloud {
+                    text.push_str(" · 云端");
+                }
                 let old: HGDIOBJ = SelectObject(hdc, HGDIOBJ(ui.fonts.meta.0));
                 // 成功：图标 + 文字（设计稿是 lucide check + mr-1）
                 let is_done = matches!(task.status, Status::Done(_));
@@ -1927,7 +1934,7 @@ unsafe fn start_convert(hwnd: HWND) {
         let tasks = u.state.tasks.clone();
         let out = u.state.out_dir.clone();
         let inject = u.inject_frontmatter.get();
-        let rx = worker::spawn(tasks, out, inject);
+        let rx = worker::spawn(tasks, out, inject, u.ocr_allow_all.clone());
         *u.rx.borrow_mut() = Some(rx);
     });
     refresh_list(hwnd);
@@ -2079,9 +2086,10 @@ pub unsafe fn update_status(hwnd: HWND) {
 }
 
 unsafe fn tick(hwnd: HWND) {
-    let mut finished: Vec<(usize, u64, Result<(u64, String), String>)> = Vec::new();
+    let mut finished: Vec<(usize, u64, Result<(u64, String, bool), String>)> = Vec::new();
     let mut progress: Vec<(usize, u8, String)> = Vec::new();
     let mut started: Vec<usize> = Vec::new();
+    let mut prompts: Vec<(usize, String, u64)> = Vec::new();
     let mut all_done = false;
 
     UI.with(|slot| {
@@ -2094,12 +2102,86 @@ unsafe fn tick(hwnd: HWND) {
                     WorkerMsg::Finished { id, elapsed_ms, result } => finished.push((id, elapsed_ms, result)),
                     WorkerMsg::Progress { id, percent, phase } => progress.push((id, percent, phase)),
                     WorkerMsg::Started { id } => started.push(id),
+                    WorkerMsg::NeedsOcrPrompt { id, name, size } => prompts.push((id, name, size)),
                     WorkerMsg::AllDone => all_done = true,
                 }
             }
         }
         *ui.borrow_mut().rx.borrow_mut() = rx;
     });
+
+    // 扫描件：弹窗问用户要不要走云端 OCR（官方 anydoc 的 --ocr hosted 一个路子）
+    let prompts = std::mem::take(&mut prompts);
+    for (id, name, size) in prompts {
+        // 用户已经选了「本次全部用云端」→ 后面这些直接放行，不再弹窗
+        let allow_all_now = UI.with(|slot| {
+            let slot = slot.borrow();
+            slot.as_ref()
+                .map(|ui| {
+                    ui.borrow()
+                        .ocr_allow_all
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(false)
+        });
+        if allow_all_now {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let u = ui.borrow();
+                    if let Some(t) = u.state.tasks.iter().find(|t| t.id == id) {
+                        let (lock, cv) = &*t.ocr_decision;
+                        if let Ok(mut g) = lock.lock() {
+                            *g = true;
+                        }
+                        cv.notify_all();
+                    }
+                }
+            });
+            continue;
+        }
+        let mb = format!(
+            "《{name}》含扫描图片页（{}），本地无法识别文字。\n\n             是否改用云端 OCR（Firecrawl Parse）转换？\n             注意：文档内容会发送到云端处理。\n\n             是 = 本次所有扫描件都用云端\n             否 = 只有这一个用云端\n             取消 = 跳过（保持失败）",
+            crate::state::fmt_size(size)
+        );
+        let title: Vec<u16> = "需要云端 OCR".encode_utf16().chain(std::iter::once(0)).collect();
+        let text: Vec<u16> = mb.encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = MessageBoxW(
+            hwnd,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNOCANCEL | MB_ICONQUESTION,
+        );
+        let choice = match ret {
+            IDYES => 2,   // 全部
+            IDNO => 1,    // 仅此文件
+            _ => 0,       // 跳过
+        };
+        if choice == 2 {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    ui.borrow()
+                        .ocr_allow_all
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        // 通知等待中的 worker
+        UI.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(ui) = slot.as_ref() {
+                let u = ui.borrow();
+                if let Some(t) = u.state.tasks.iter().find(|t| t.id == id) {
+                    let (lock, cv) = &*t.ocr_decision;
+                    if let Ok(mut g) = lock.lock() {
+                        *g = choice != 0;
+                    }
+                    cv.notify_all();
+                }
+            }
+        });
+    }
 
     if finished.is_empty() && progress.is_empty() && !all_done {
         return;
@@ -2130,10 +2212,11 @@ unsafe fn tick(hwnd: HWND) {
                 let root = u.state.out_dir.clone();
                 if let Some(t) = u.state.tasks.iter_mut().find(|t| t.id == id) {
                     match result {
-                        Ok((size, _)) => {
+                        Ok((size, _, via_cloud)) => {
                             t.status = Status::Done(elapsed_ms);
                             t.out_size = size;
                             t.progress = 100;
+                            t.via_cloud = via_cloud;
                             // 记录输出路径，用于「打开所在文件夹」
                             let root = root.unwrap_or_else(|| {
                                 t.path

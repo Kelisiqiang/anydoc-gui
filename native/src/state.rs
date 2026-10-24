@@ -4,6 +4,7 @@
 // 所有 UI 更新必须发生在主线程；后台线程只通过 channel 回传结果。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// 单个转换任务的状态
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +51,11 @@ pub struct Task {
     pub out_path: Option<PathBuf>,
     /// 取消标志（与后台线程共享，点 ✕ 时置位，worker 各阶段检查）
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 云端 OCR 的决定：worker 在这里等 UI 线程的回答
+    /// （true = 用云端 OCR，false = 跳过）
+    pub ocr_decision: Arc<(Mutex<bool>, Condvar)>,
+    /// 这一份是不是走的云端 OCR（界面上标个「云端」）
+    pub via_cloud: bool,
 }
 
 impl Task {
@@ -79,6 +85,8 @@ impl Task {
             phase: String::new(),
             out_path: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ocr_decision: Arc::new((Mutex::new(false), Condvar::new())),
+            via_cloud: false,
         }
     }
 
@@ -160,12 +168,21 @@ pub enum WorkerMsg {
         /// 阶段文字
         phase: String,
     },
+    /// 遇到扫描页：问用户要不要走云端 OCR
+    NeedsOcrPrompt {
+        id: usize,
+        /// 文件名
+        name: String,
+        /// 文件大小（字节）
+        size: u64,
+    },
     /// 某个任务完成
     Finished {
         id: usize,
         /// 耗时（毫秒）
         elapsed_ms: u64,
-        result: Result<(u64, String), String>,
+        /// (输出大小, 内容, 是否走云端 OCR)
+        result: Result<(u64, String, bool), String>,
     },
     /// 全部结束
     AllDone,

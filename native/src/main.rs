@@ -7,6 +7,7 @@ mod dpi;
 mod frontmatter;
 mod draw;
 mod icons;
+mod ocr;
 mod state;
 #[cfg(test)]
 mod tests;

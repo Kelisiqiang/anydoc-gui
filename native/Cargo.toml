@@ -1,6 +1,6 @@
 [package]
 name = "anydoc-native"
-version = "0.5.4"
+version = "0.5.5"
 description = "AnyDoc for Windows - 原生窗口版文档转 Markdown 工具"
 authors = ["AnyDoc Team"]
 edition = "2021"
@@ -17,6 +17,7 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 walkdir = "2.4"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
 windows = { version = "0.58", features = [
   "Win32_Foundation",
