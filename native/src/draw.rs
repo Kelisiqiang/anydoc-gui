@@ -849,12 +849,14 @@ fn arc_points(
     out
 }
 
-/// 云朵上传图标（tabler / 设计稿 cloud-upload）
+/// 云朵上传图标（tabler cloud-upload 新版）
 ///
-/// 设计稿路径：
-///   M7 16 a4 4 0 0 1 -.88 -7.903 A5 5 0 1 1 15.9 6 L16 6 a5 5 0 0 1 1 9.9
-///   M15 13 l-3 -3 m0 0 l-3 3 m3 -3 v12
-/// 云是三段圆弧拼的（底部开口），上传箭头从云底穿出。
+/// 路径：
+///   M7 18 a4.6 4.4 0 0 1 0 -9 a5 4.5 0 0 1 11 2 h1 a3.5 3.5 0 0 1 0 7 h-1
+///   M9 15 l3 -3 l3 3
+///   M12 12 l0 9
+/// 云是一段近闭合的饱满轮廓（底部有平底线），上传箭头整个在云里、
+/// 杆子从云下穿出 —— 比旧版（云是三段大小不一的鼓包、箭头杆直伸到底）更稳。
 pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
     unsafe {
         let f = size as f64 / 24.0;
@@ -867,16 +869,18 @@ pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLO
             }
         };
 
-        // ── 云轮廓：左小弧 → 顶大弧 → 一小段直线 → 右弧 ──
+        // ── 云轮廓：左弧 → 顶弧 → 一小段横线 → 右弧 → 一小段横线 ──
         let mut cloud: Vec<(f64, f64)> = Vec::new();
-        // M7 16 a4 4 0 0 1 -.88 -7.903  →  (6.12, 8.097)
-        cloud.extend(arc_points(7.0, 16.0, 4.0, 4.0, false, true, 6.12, 8.097));
-        // A5 5 0 1 1 15.9 6
-        cloud.extend(arc_points(6.12, 8.097, 5.0, 5.0, true, true, 15.9, 6.0));
-        // L16 6
-        cloud.push((16.0, 6.0));
-        // a5 5 0 0 1 1 9.9 → (17, 15.9)
-        cloud.extend(arc_points(16.0, 6.0, 5.0, 5.0, false, true, 17.0, 15.9));
+        // M7 18 a4.6 4.4 0 0 1 0 -9   → (7, 9)
+        cloud.extend(arc_points(7.0, 18.0, 4.6, 4.4, false, true, 7.0, 9.0));
+        // a5 4.5 0 0 1 11 2            → (18, 11)
+        cloud.extend(arc_points(7.0, 9.0, 5.0, 4.5, false, true, 18.0, 11.0));
+        // h1                          → (19, 11)
+        cloud.push((19.0, 11.0));
+        // a3.5 3.5 0 0 1 0 7           → (19, 18)
+        cloud.extend(arc_points(19.0, 11.0, 3.5, 3.5, false, true, 19.0, 18.0));
+        // h-1                         → (18, 18)
+        cloud.push((18.0, 18.0));
 
         for (i, (x, y)) in cloud.iter().enumerate() {
             let pt = p(*x, *y);
@@ -887,13 +891,13 @@ pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLO
             }
         }
 
-        // ── 上传箭头：M15 13 l-3 -3 m0 0 l-3 3 m3 -3 v12 ──
-        let head = [p(15.0, 13.0), p(12.0, 10.0), p(9.0, 13.0)];
+        // ── 上传箭头：M9 15 l3 -3 l3 3 ／ M12 12 l0 9 ──
+        let head = [p(9.0, 15.0), p(12.0, 12.0), p(15.0, 15.0)];
         MoveToEx(hdc, head[0].x, head[0].y, None);
         LineTo(hdc, head[1].x, head[1].y);
         LineTo(hdc, head[2].x, head[2].y);
-        let shaft_top = p(12.0, 10.0);
-        let shaft_bot = p(12.0, 22.0);
+        let shaft_top = p(12.0, 12.0);
+        let shaft_bot = p(12.0, 21.0);
         MoveToEx(hdc, shaft_top.x, shaft_top.y, None);
         LineTo(hdc, shaft_bot.x, shaft_bot.y);
 
