@@ -1433,6 +1433,7 @@ unsafe fn draw_table(hdc: HDC, ui: &Ui, hwnd: HWND, l: &Layout) {
             Status::Done(_) | Status::Error(_) | Status::Wait => {
                 let (mut text, fg, bgc, _) = status_style(th, &task.status);
                 // 云端 OCR 转换的，标一下
+                #[cfg(feature = "ocr")]
                 if task.via_cloud {
                     text.push_str(" · 云端");
                 }
@@ -1934,7 +1935,8 @@ unsafe fn start_convert(hwnd: HWND) {
         let tasks = u.state.tasks.clone();
         let out = u.state.out_dir.clone();
         let inject = u.inject_frontmatter.get();
-        let rx = worker::spawn(tasks, out, inject, u.ocr_allow_all.clone());
+        let allow_all = u.ocr_allow_all.clone();
+        let rx = worker::spawn(tasks, out, inject, allow_all);
         *u.rx.borrow_mut() = Some(rx);
     });
     refresh_list(hwnd);
@@ -2089,6 +2091,7 @@ unsafe fn tick(hwnd: HWND) {
     let mut finished: Vec<(usize, u64, Result<(u64, String, bool), String>)> = Vec::new();
     let mut progress: Vec<(usize, u8, String)> = Vec::new();
     let mut started: Vec<usize> = Vec::new();
+    #[cfg(feature = "ocr")]
     let mut prompts: Vec<(usize, String, u64)> = Vec::new();
     let mut all_done = false;
 
@@ -2102,6 +2105,7 @@ unsafe fn tick(hwnd: HWND) {
                     WorkerMsg::Finished { id, elapsed_ms, result } => finished.push((id, elapsed_ms, result)),
                     WorkerMsg::Progress { id, percent, phase } => progress.push((id, percent, phase)),
                     WorkerMsg::Started { id } => started.push(id),
+                    #[cfg(feature = "ocr")]
                     WorkerMsg::NeedsOcrPrompt { id, name, size } => prompts.push((id, name, size)),
                     WorkerMsg::AllDone => all_done = true,
                 }
@@ -2111,7 +2115,9 @@ unsafe fn tick(hwnd: HWND) {
     });
 
     // 扫描件：弹窗问用户要不要走云端 OCR（官方 anydoc 的 --ocr hosted 一个路子）
+    #[cfg(feature = "ocr")]
     let prompts = std::mem::take(&mut prompts);
+    #[cfg(feature = "ocr")]
     for (id, name, size) in prompts {
         // 用户已经选了「本次全部用云端」→ 后面这些直接放行，不再弹窗
         let allow_all_now = UI.with(|slot| {
@@ -2216,7 +2222,12 @@ unsafe fn tick(hwnd: HWND) {
                             t.status = Status::Done(elapsed_ms);
                             t.out_size = size;
                             t.progress = 100;
-                            t.via_cloud = via_cloud;
+                            #[cfg(feature = "ocr")]
+                            {
+                                t.via_cloud = via_cloud;
+                            }
+                            #[cfg(not(feature = "ocr"))]
+                            let _ = via_cloud;
                             // 记录输出路径，用于「打开所在文件夹」
                             let root = root.unwrap_or_else(|| {
                                 t.path

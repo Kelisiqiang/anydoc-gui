@@ -1,6 +1,6 @@
 [package]
 name = "anydoc-native"
-version = "0.5.5"
+version = "0.5.6"
 description = "AnyDoc for Windows - 原生窗口版文档转 Markdown 工具"
 authors = ["AnyDoc Team"]
 edition = "2021"
@@ -11,13 +11,18 @@ license = "MIT"
 name = "anydoc"
 path = "src/main.rs"
 
+[features]
+# 云端 OCR（把扫描版 PDF 发到 Firecrawl Parse 识别）。
+# 默认关闭 —— 发布版不包含任何云端逻辑；需要时 cargo build --features ocr
+ocr = ["dep:ureq"]
+
 [dependencies]
 anydoc = "0.2.4"          # 官方解析内核 (MIT)
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 walkdir = "2.4"
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3", optional = true, default-features = false, features = ["rustls", "gzip"] }
 
 windows = { version = "0.58", features = [
   "Win32_Foundation",

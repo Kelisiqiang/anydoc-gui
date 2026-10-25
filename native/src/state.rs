@@ -4,6 +4,7 @@
 // 所有 UI 更新必须发生在主线程；后台线程只通过 channel 回传结果。
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ocr")]
 use std::sync::{Arc, Condvar, Mutex};
 
 /// 单个转换任务的状态
@@ -53,8 +54,10 @@ pub struct Task {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 云端 OCR 的决定：worker 在这里等 UI 线程的回答
     /// （true = 用云端 OCR，false = 跳过）
+    #[cfg(feature = "ocr")]
     pub ocr_decision: Arc<(Mutex<bool>, Condvar)>,
     /// 这一份是不是走的云端 OCR（界面上标个「云端」）
+    #[cfg(feature = "ocr")]
     pub via_cloud: bool,
 }
 
@@ -85,7 +88,9 @@ impl Task {
             phase: String::new(),
             out_path: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "ocr")]
             ocr_decision: Arc::new((Mutex::new(false), Condvar::new())),
+            #[cfg(feature = "ocr")]
             via_cloud: false,
         }
     }
@@ -169,6 +174,7 @@ pub enum WorkerMsg {
         phase: String,
     },
     /// 遇到扫描页：问用户要不要走云端 OCR
+    #[cfg(feature = "ocr")]
     NeedsOcrPrompt {
         id: usize,
         /// 文件名

@@ -136,6 +136,7 @@ fn map_error(e: anydoc::ConvertError) -> String {
     }
 }
 
+#[cfg(feature = "ocr")]
 /// 问用户：这份扫描件要不要走云端 OCR
 ///
 /// 官方 anydoc 本地不做 OCR（遇到扫描页直接报 needsOcr），
@@ -179,29 +180,38 @@ fn parse_bytes(
     let md = match anydoc::to_markdown_bytes(bytes, format) {
         Ok(m) => (m, false),
         Err(anydoc::ConvertError::NeedsOcr { .. }) => {
-            // 本地没有 OCR 能力，交给云端（和官方 --ocr hosted 一个路子）
-            if task.ext != "pdf" {
-                return Err("需 OCR（该格式不支持云端 OCR）".to_string());
-            }
-            if !ask_cloud_ocr(task, tx, allow_all) {
-                return Err("需 OCR（已跳过）".to_string());
-            }
-            if task.is_cancelled() {
-                return Err(CANCELLED.to_string());
-            }
-            let _ = tx.send(WorkerMsg::Progress {
-                id: task.id,
-                percent: 40,
-                phase: "云端 OCR".to_string(),
-            });
-            let md = match crate::ocr::hosted_markdown(bytes, &task.name) {
-                Ok(m) => m,
-                Err(e) => {
-                    crate::ui::diag(&format!("云端 OCR 失败: {e}"));
-                    return Err(e);
+            // 本地内核没有 OCR 能力（官方 anydoc 也是如此）
+            #[cfg(feature = "ocr")]
+            {
+                // 编译时开了云端 OCR：问用户后交给 Firecrawl Parse
+                if task.ext != "pdf" {
+                    return Err("需 OCR（该格式不支持云端 OCR）".to_string());
                 }
-            };
-            (md, true)
+                if !ask_cloud_ocr(task, tx, allow_all) {
+                    return Err("需 OCR（已跳过）".to_string());
+                }
+                if task.is_cancelled() {
+                    return Err(CANCELLED.to_string());
+                }
+                let _ = tx.send(WorkerMsg::Progress {
+                    id: task.id,
+                    percent: 40,
+                    phase: "云端 OCR".to_string(),
+                });
+                let md = match crate::ocr::hosted_markdown(bytes, &task.name) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        crate::ui::diag(&format!("云端 OCR 失败: {e}"));
+                        return Err(e);
+                    }
+                };
+                (md, true)
+            }
+            #[cfg(not(feature = "ocr"))]
+            {
+                let _ = (tx, allow_all);
+                return Err("需 OCR（本地不含 OCR）".to_string());
+            }
         }
         Err(e) => return Err(map_error(e)),
     };
