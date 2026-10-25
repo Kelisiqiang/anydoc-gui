@@ -88,6 +88,10 @@ pub struct Ui {
     pub inject_frontmatter: Cell<bool>,
     /// 用户是否同意「本次所有扫描件都走云端 OCR」（与 worker 线程共享）
     pub ocr_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 复用的离屏缓冲（内存 DC + 位图）。
+    /// 每帧新建/销毁一张几 MB 的位图会造成卡顿（看起来像闪烁），所以缓存起来复用。
+    /// 尺寸变了才重建。
+    pub backbuf: RefCell<Option<(HDC, HBITMAP, i32, i32)>>,
 }
 
 thread_local! {
@@ -358,6 +362,20 @@ pub unsafe extern "system" fn wnd_proc(
             let _ = refresh_theme(hwnd);
             LRESULT(0)
         }
+        // 显示器/分辨率变了：离屏缓冲是按旧显示设备建的，丢掉重建
+        WM_DISPLAYCHANGE => {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(ui) = slot.as_ref() {
+                    let old = ui.borrow().backbuf.borrow_mut().take();
+                    if let Some((dc, bmp, _, _)) = old {
+                        let _ = DeleteObject(HGDIOBJ(bmp.0));
+                        let _ = DeleteDC(dc);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -408,6 +426,7 @@ unsafe fn on_create(hwnd: HWND) -> windows::core::Result<()> {
         app_icon,
         inject_frontmatter: Cell::new(true),
         ocr_allow_all: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        backbuf: RefCell::new(None),
     }));
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
@@ -1003,35 +1022,31 @@ unsafe fn paint(hwnd: HWND) {
         return;
     }
 
-    // 双缓冲
-    let mem_dc = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, cw, ch);
-    // 位图太大（内存不够）时别硬撑，直接往窗口 DC 上画
-    let double_buffer = !bmp.0.is_null() && (cw as i64) * (ch as i64) <= 30_000_000;
-    let (target, old_bmp) = if double_buffer {
-        let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
-        (mem_dc, Some(old))
-    } else {
+    // 双缓冲：离屏 DC + 位图**复用**（每帧新建销毁几 MB 位图会卡，看起来像闪烁）
+    let (target, mem_dc_opt) = match acquire_backbuf(hdc, cw, ch) {
+        Some((mem_dc, _bmp)) => (mem_dc, Some(mem_dc)),
+        None => {
         // 位图建不出来（内存不够 / 客户区太大）→ 直接往窗口 DC 上画，
         // 至少还能显示内容，绝不黑屏
         diag(&format!("放弃双缓冲，直接绘制 cw={cw} ch={ch}"));
-        (hdc, None)
-    };
-
-    // 先把背景直接刷到窗口上：即使后面哪一步出问题，也不会留下黑屏
-    let bg0 = {
-        UI.with(|slot| {
-            let slot = slot.borrow();
-            slot.as_ref().map(|ui| {
-                let ui = ui.borrow();
-                CreateSolidBrush(ui.theme.bg)
+        // 只有走这条兜底路径时才直接刷窗口 DC。
+        // （正常双缓冲时千万别先刷窗口：那会让每帧都闪一下背景色）
+        let bg0 = {
+            UI.with(|slot| {
+                let slot = slot.borrow();
+                slot.as_ref().map(|ui| {
+                    let ui = ui.borrow();
+                    CreateSolidBrush(ui.theme.bg)
+                })
             })
-        })
+        };
+            if let Some(bg0) = bg0 {
+                let _ = FillRect(hdc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg0);
+                let _ = DeleteObject(HGDIOBJ(bg0.0));
+            }
+            (hdc, None)
+        }
     };
-    if let Some(bg0) = bg0 {
-        let _ = FillRect(hdc, &RECT { left: 0, top: 0, right: cw, bottom: ch }, bg0);
-        let _ = DeleteObject(HGDIOBJ(bg0.0));
-    }
 
     UI.with(|slot| {
         let slot = slot.borrow();
@@ -1054,13 +1069,62 @@ unsafe fn paint(hwnd: HWND) {
         draw_foot(target, &ui, hwnd, &l);
     });
 
-    if double_buffer {
+    if let Some(mem_dc) = mem_dc_opt {
         let _ = BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
-        let _ = SelectObject(mem_dc, old_bmp.unwrap());
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        // 位图和内存 DC 留着复用，不删
     }
-    let _ = DeleteDC(mem_dc);
     let _ = EndPaint(hwnd, &ps);
+}
+
+/// 取（必要时重建）离屏缓冲：返回 (内存 DC, 位图句柄)
+/// 尺寸不变就复用，尺寸变了才重建。
+unsafe fn acquire_backbuf(hdc: HDC, cw: i32, ch: i32) -> Option<(HDC, HBITMAP)> {
+    // 太大的客户区就不双缓冲了，直接往窗口上画
+    if (cw as i64) * (ch as i64) > 30_000_000 {
+        diag(&format!("放弃双缓冲，客户区太大 cw={cw} ch={ch}"));
+        return None;
+    }
+    let cached = UI.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref().and_then(|ui| {
+            let u = ui.borrow();
+            let bb = u.backbuf.borrow();
+            bb.map(|(dc, bmp, w, h)| (dc, bmp, w, h))
+        })
+    });
+    if let Some((dc, bmp, w, h)) = cached {
+        if w == cw && h == ch && !HGDIOBJ(bmp.0).0.is_null() {
+            return Some((dc, bmp));
+        }
+        // 尺寸变了：旧的用完再重建
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(dc);
+        UI.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(ui) = slot.as_ref() {
+                *ui.borrow().backbuf.borrow_mut() = None;
+            }
+        });
+    }
+    let mem_dc = CreateCompatibleDC(hdc);
+    if HGDIOBJ(mem_dc.0).0.is_null() {
+        return None;
+    }
+    let bmp = CreateCompatibleBitmap(hdc, cw, ch);
+    if bmp.0.is_null() {
+        let _ = DeleteDC(mem_dc);
+        diag(&format!("离屏位图创建失败 cw={cw} ch={ch}"));
+        return None;
+    }
+    // 位图常驻选进内存 DC，后面每帧直接往里画
+    let _ = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+    UI.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(ui) = slot.as_ref() {
+            *ui.borrow().backbuf.borrow_mut() = Some((mem_dc, bmp, cw, ch));
+        }
+    });
+    Some((mem_dc, bmp))
 }
 
 /// ① 品牌条

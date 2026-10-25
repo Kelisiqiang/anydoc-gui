@@ -31,7 +31,7 @@ Releases 页只有一个包：
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| [`AnyDoc-v0.5.6-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.6/AnyDoc-v0.5.6-win-x64-portable.zip) | 3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
+| [`AnyDoc-v0.5.7-win-x64-portable.zip`](https://github.com/Kelisiqiang/anydoc-gui/releases/download/v0.5.7/AnyDoc-v0.5.7-win-x64-portable.zip) | 3.7MB | **免安装版**：解压即用，不需要装任何运行时 |
 
 > 解压后目录结构要保留（`resources/` 里是图标资源）。
 > 已用 SHA256 自签名 + DigiCert 时间戳签名。
@@ -106,6 +106,7 @@ anydoc 读取文件签名（PDF header、RTF open group、OLE stream name、ZIP 
 
 | 版本 | 改动 |
 |------|------|
+| **v0.5.7** | **修使用过程闪烁**：v0.5.4 加的「防黑屏兜底」有个副作用 —— 每次重绘都先把整个窗口刷成背景色再贴内容，等于每帧闪一下（转换时进度条动画最明显）。改成只在「位图建不出来」的兜底路径才刷窗口；同时离屏位图改成**复用**（原来每帧新建/销毁一张几 MB 的位图，分配抖动也会看成卡顿） |
 | **v0.5.6** | **回到纯本地版：不含任何云端功能**，程序运行期间不联网、不上传文档（v0.5.5 那版的云端 OCR 已撤下，能力保留在源码的 `ocr` 编译开关里，需要时一句话就能开回来） |
 | **v0.5.5** | ⚠️ **这一版带云端 OCR**（会把扫描件发到 Firecrawl 解析）。介意隐私、或不需要的话请改用 **v0.5.6** |
 | **v0.5.4** | **修最大化黑屏**：客户区计算改成用 `WINDOWPOS` 的窗口矩形（不再混用屏幕/窗口两套坐标），最大化时客户区 = 工作区 ∩ 窗口矩形；位图建不出来时不再往窗口里塞 NULL（那会导致整个界面画不出来 = 黑屏），改为直接往窗口 DC 绘制；客户区异常时先夹紧再画；新增 `anydoc-diag.log` 诊断日志与崩溃自动记录 |

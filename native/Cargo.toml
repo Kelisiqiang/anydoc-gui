@@ -1,6 +1,6 @@
 [package]
 name = "anydoc-native"
-version = "0.5.6"
+version = "0.5.7"
 description = "AnyDoc for Windows - 原生窗口版文档转 Markdown 工具"
 authors = ["AnyDoc Team"]
 edition = "2021"
