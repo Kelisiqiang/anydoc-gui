@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AnyDoc 本地转换器</title>
+<script src="/static/vendor/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1f2329;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #ff5c38;
+    --accent-soft: #fff0ec;
+    --ok: #16a34a;
+    --ok-soft: #ecfdf3;
+    --err: #dc2626;
+    --err-soft: #fef2f2;
+    --warn: #b45309;
+    --warn-soft: #fffbeb;
+    --radius: 14px;
+    --shadow: 0 1px 3px rgba(16, 24, 40, .06), 0 1px 2px rgba(16, 24, 40, .04);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 12px; flex: none;
+    background: linear-gradient(135deg, #ff5c38, #ff8a5c);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 800; font-size: 18px;
+    box-shadow: 0 4px 12px rgba(255, 92, 56, .25);
+  }
+  header h1 { font-size: 20px; font-weight: 700; }
+  header p { font-size: 13px; color: var(--muted); }
+  .badge {
+    margin-left: auto; font-size: 12px; color: var(--ok);
+    background: var(--ok-soft); border: 1px solid #bbf7d0;
+    padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+  }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+
+  .dropzone {
+    border: 2px dashed #d1d5db; border-radius: var(--radius);
+    background: #fafbfc; padding: 42px 20px; text-align: center;
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .dropzone:hover, .dropzone.drag {
+    border-color: var(--accent); background: var(--accent-soft);
+  }
+  .dropzone .dz-icon { font-size: 34px; margin-bottom: 8px; }
+  .dropzone .dz-main { font-size: 15px; font-weight: 600; }
+  .dropzone .dz-sub { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+  .dropzone .dz-formats { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  .opts { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 24px; }
+  .opt { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; user-select: none; }
+  .opt input[type=checkbox] { width: 17px; height: 17px; margin-top: 3px; accent-color: var(--accent); cursor: pointer; }
+  .opt .t { font-size: 14px; font-weight: 600; }
+  .opt .d { font-size: 12px; color: var(--muted); max-width: 340px; }
+  .api-key { flex: 1; min-width: 260px; }
+  .api-key label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  .api-key input {
+    width: 100%; padding: 9px 12px; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 8px; outline: none;
+    transition: border-color .15s;
+  }
+  .api-key textarea {
+    width: 100%; padding: 9px 12px; font-size: 13px; resize: vertical;
+    border: 1px solid var(--border); border-radius: 8px; outline: none;
+    font-family: inherit; line-height: 1.5; box-sizing: border-box;
+    transition: border-color .15s;
+  }
+  .api-key input:focus, .api-key textarea:focus { border-color: var(--accent); }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .toolbar .spacer { flex: 1; }
+  .stats { font-size: 13px; color: var(--muted); }
+  .stats b { color: var(--text); font-weight: 600; }
+  .stats .s-ok { color: var(--ok); } .stats .s-err { color: var(--err); }
+
+  .btn {
+    border: 1px solid var(--border); background: #fff; color: var(--text);
+    font-size: 13px; font-weight: 500; padding: 8px 14px; border-radius: 8px;
+    cursor: pointer; transition: background .15s, border-color .15s; font-family: inherit;
+  }
+  .btn:hover { background: #f3f4f6; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #e94e2c; }
+
+  .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 26px 0; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th {
+    text-align: left; color: var(--muted); font-weight: 500;
+    font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td { padding: 10px; border-bottom: 1px solid #f1f2f4; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .f-name { word-break: break-all; max-width: 340px; }
+  .f-size { color: var(--muted); white-space: nowrap; font-size: 12.5px; }
+  .f-actions { white-space: nowrap; text-align: right; }
+  .link { color: var(--accent); cursor: pointer; font-size: 12.5px; margin-left: 10px; text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+  .link.danger { color: var(--err); }
+  .st { font-size: 12.5px; white-space: nowrap; font-weight: 500; }
+  .st-queued { color: var(--muted); }
+  .st-working { color: var(--accent); }
+  .st-done { color: var(--ok); }
+  .st-error { color: var(--err); }
+  .err-text { font-size: 12px; color: var(--err); max-width: 420px; }
+  .ocr-warn { font-size: 12px; line-height: 1.5; color: #7a5b00; background: #fff8e1;
+    border: 1px solid #f0dc9e; border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px; vertical-align: -2px; margin-right: 6px;
+    border: 2px solid rgba(255, 92, 56, .25); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  footer .dot { margin: 0 6px; }
+
+  /* 预览弹窗 */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, .45);
+    display: none; align-items: center; justify-content: center; z-index: 50; padding: 24px;
+  }
+  .modal-mask.open { display: flex; }
+  .modal {
+    background: #fff; border-radius: 16px; width: 100%; max-width: 900px;
+    height: min(82vh, 760px); display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.25);
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-head .m-title { font-weight: 600; font-size: 14px; word-break: break-all; flex: 1; }
+  .tabs { display: flex; background: #f3f4f6; border-radius: 8px; padding: 3px; }
+  .tabs button {
+    border: none; background: transparent; font-size: 12.5px; padding: 6px 14px;
+    border-radius: 6px; cursor: pointer; color: var(--muted); font-family: inherit;
+  }
+  .tabs button.on { background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); font-weight: 600; }
+  .modal-body { flex: 1; overflow: auto; padding: 20px 24px; font-size: 14px; }
+  .modal-body pre {
+    white-space: pre-wrap; word-break: break-word; font-family: Consolas, "Courier New", monospace;
+    font-size: 12.8px; line-height: 1.7; color: #24292f;
+  }
+  .modal-body .md-view h1, .modal-body .md-view h2, .modal-body .md-view h3 { margin: 18px 0 8px; line-height: 1.35; }
+  .modal-body .md-view h1 { font-size: 22px; } .modal-body .md-view h2 { font-size: 19px; } .modal-body .md-view h3 { font-size: 16px; }
+  .modal-body .md-view p { margin: 8px 0; }
+  .modal-body .md-view ul, .modal-body .md-view ol { margin: 8px 0; padding-left: 24px; }
+  .modal-body .md-view li { margin: 3px 0; }
+  .modal-body .md-view table { border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+  .modal-body .md-view th, .modal-body .md-view td { border: 1px solid #d1d5db; padding: 5px 10px; }
+  .modal-body .md-view th { background: #f3f4f6; }
+  .modal-body .md-view code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .modal-body .md-view pre { background: #f6f8fa; padding: 12px; border-radius: 8px; overflow: auto; }
+  .modal-body .md-view pre code { background: none; padding: 0; }
+  .modal-body .md-view blockquote { border-left: 3px solid #d1d5db; margin: 8px 0; padding: 2px 12px; color: var(--muted); }
+  .modal-body .md-view a { color: var(--accent); }
+  .modal-body .md-view img { max-width: 100%; }
+  .modal-empty { color: var(--muted); text-align: center; padding: 60px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">A</div>
+    <div>
+      <h1>AnyDoc 本地转换器</h1>
+      <p>把 Word / PPT / Excel / PDF 等文档一键转成 Markdown</p>
+    </div>
+    <span class="badge">● 本地运行 · 文件不出电脑</span>
+  </header>
+
+  <section class="card">
+    <div class="dropzone" id="dropzone">
+      <div class="dz-icon">📄</div>
+      <div class="dz-main">把文件拖到这里，或点击选择文件</div>
+      <div class="dz-sub">支持一次拖入多个文件，自动排队转换</div>
+      <div class="dz-formats">Word(.doc/.docx/.docm) · PowerPoint(.ppt/.pptx…) · Excel(.xls/.xlsx…) · PDF · OpenDocument · RTF · EPUB · CSV</div>
+    </div>
+    <input type="file" id="fileInput" multiple accept=".doc,.docx,.docm,.ppt,.pps,.pot,.pptx,.pptm,.ppsx,.ppsm,.xls,.xlsx,.xlsm,.xlsb,.odt,.ods,.odp,.rtf,.epub,.csv,.pdf" style="display:none">
+  </section>
+
+  <section class="card">
+    <h2>转换选项</h2>
+    <div class="opts">
+      <label class="opt">
+        <input type="checkbox" id="ocrToggle">
+        <span>
+          <span class="t">联网 OCR（识别扫描版 PDF）</span>
+          <span class="d">扫描/纯图片 PDF 本地无法识别，开启后按顺序尝试：MinerU（若填写 Token）→ Firecrawl 官方解析；其余文件仍在本机转换。</span>
+        </span>
+      </label>
+      <div class="api-key">
+        <label for="mineruKeys">MinerU API Token（可选，可填多个，每行一个，额度不足自动轮询）</label>
+        <textarea id="mineruKeys" rows="3" placeholder="在 mineru.net 官网申请的 Token，每行填一个&#10;解析失败或额度不足时，自动按顺序换下一个 Token 重试"></textarea>
+      </div>
+      <div class="api-key">
+        <label for="apiKey">Firecrawl API Key（可选，MinerU 不可用时的兜底通道）</label>
+        <input type="password" id="apiKey" placeholder="不填也能用，额度较低">
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <h2 style="margin:0">转换列表</h2>
+      <span class="spacer"></span>
+      <span class="stats" id="stats"></span>
+      <button class="btn" id="btnDownloadAll" disabled>打包下载全部</button>
+      <button class="btn" id="btnOpenOut">打开输出文件夹</button>
+      <button class="btn" id="btnQuit" title="结束本工具运行">退出程序</button>
+      <button class="btn" id="btnClear" disabled>清空列表</button>
+    </div>
+    <div id="listArea">
+      <div class="empty">还没有文件，把文档拖进来试试</div>
+    </div>
+  </section>
+
+  <footer id="footer">AnyDoc 引擎加载中…</footer>
+</div>
+
+<div class="modal-mask" id="modal">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="m-title" id="modalTitle"></span>
+      <div class="tabs">
+        <button id="tabRender" class="on">渲染视图</button>
+        <button id="tabSource">源码</button>
+      </div>
+      <button class="btn" id="btnCopy">复制</button>
+      <button class="btn" id="btnCloseModal">关闭</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var MAX_CONCURRENT = 2;
+  var SUPPORTED = [
+    ".doc",".docx",".docm",".ppt",".pps",".pot",".pptx",".pptm",".ppsx",".ppsm",
+    ".xls",".xlsx",".xlsm",".xlsb",".odt",".ods",".odp",".rtf",".epub",".csv",".pdf"
+  ];
+
+  var state = { files: [], running: 0, ocrWarn: false };
+  var uid = 0;
+  var modalJob = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var dropzone = $("dropzone"), fileInput = $("fileInput");
+  var listArea = $("listArea"), stats = $("stats");
+
+  // ---------- 引擎信息 ----------
+  fetch("/api/info").then(function (r) { return r.json(); }).then(function (j) {
+    if (j.ok) $("footer").textContent =
+      "AnyDoc 引擎 firecrawl-anydoc v" + j.version + "（Firecrawl 开源） · 本机转换，单文件上限 " + j.max_file_mb + " MB";
+  }).catch(function () {
+    $("footer").textContent = "AnyDoc 本地转换器";
+  });
+
+  // ---------- 文件选择与拖拽 ----------
+  dropzone.addEventListener("click", function () { fileInput.click(); });
+  fileInput.addEventListener("change", function () {
+    addFiles(fileInput.files);
+    fileInput.value = "";
+  });
+  ["dragover", "dragenter"].forEach(function (ev) {
+    dropzone.addEventListener(ev, function (e) { e.preventDefault(); dropzone.classList.add("drag"); });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    dropzone.addEventListener(ev, function (e) { e.preventDefault(); dropzone.classList.remove("drag"); });
+  });
+  dropzone.addEventListener("drop", function (e) {
+    if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+  });
+
+  function addFiles(fileList) {
+    var added = 0;
+    Array.prototype.forEach.call(fileList, function (f) {
+      var ext = (f.name.lastIndexOf(".") >= 0
+        ? f.name.slice(f.name.lastIndexOf(".")).toLowerCase() : "");
+      if (SUPPORTED.indexOf(ext) < 0) return;
+      if (ext === ".pdf" && f.size > 8 * 1048576) state.ocrWarn = true;
+      state.files.push({
+        id: ++uid, file: f, name: f.name, size: f.size,
+        status: "queued", error: null, jobId: null, markdown: null, chars: 0
+      });
+      added++;
+    });
+    if (added) { render(); pump(); }
+  }
+
+  // ---------- 转换 ----------
+  function pump() {
+    while (state.running < MAX_CONCURRENT) {
+      var item = null;
+      for (var i = 0; i < state.files.length; i++) {
+        if (state.files[i].status === "queued") { item = state.files[i]; break; }
+      }
+      if (!item) break;
+      convertOne(item);
+    }
+  }
+
+  function convertOne(item) {
+    item.status = "working";
+    state.running++;
+    render();
+
+    var fd = new FormData();
+    fd.append("file", item.file, item.name);
+    fd.append("ocr", $("ocrToggle").checked ? "1" : "0");
+    fd.append("mineru_keys", $("mineruKeys").value.trim());
+    fd.append("api_key", $("apiKey").value.trim());
+
+    fetch("/api/convert", { method: "POST", body: fd })
+      .then(function (r) {
+        if (r.status === 413) throw new Error("文件超过 500MB 上限");
+        return r.json().catch(function () { throw new Error("服务器返回异常"); });
+      })
+      .then(function (j) {
+        if (j.ok) {
+          item.status = "done";
+          item.jobId = j.job_id;
+          item.markdown = j.markdown;
+          item.chars = j.chars;
+        } else {
+          item.status = "error";
+          item.error = j.error || "转换失败";
+        }
+      })
+      .catch(function (e) {
+        item.status = "error";
+        item.error = (e && e.message) ? e.message : "网络错误：本地服务未运行";
+      })
+      .then(function () {
+        state.running--;
+        render();
+        pump();
+      });
+  }
+
+  // ---------- 渲染 ----------
+  function fmtSize(n) {
+    if (n == null) return "";
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1048576).toFixed(1) + " MB";
+  }
+
+  function statusHtml(item) {
+    if (item.status === "queued") return '<span class="st st-queued">排队中…</span>';
+    if (item.status === "working") return '<span class="st st-working"><span class="spinner"></span>转换中…</span>';
+    if (item.status === "done") return '<span class="st st-done">✓ 完成（' + item.chars + ' 字符）</span>';
+    return '<span class="st st-error">✕ 失败</span>';
+  }
+
+  function actionsHtml(item) {
+    if (item.status === "done") {
+      return '<a class="link" data-act="preview" data-id="' + item.id + '">预览</a>' +
+             '<a class="link" data-act="download" data-id="' + item.id + '">下载</a>' +
+             '<a class="link danger" data-act="remove" data-id="' + item.id + '">移除</a>';
+    }
+    if (item.status === "error") {
+      return '<a class="link danger" data-act="remove" data-id="' + item.id + '">移除</a>';
+    }
+    return '<a class="link danger" data-act="remove" data-id="' + item.id + '">移除</a>';
+  }
+
+  function render() {
+    var done = 0, err = 0, queued = 0;
+    state.files.forEach(function (f) {
+      if (f.status === "done") done++;
+      else if (f.status === "error") err++;
+      else queued++;
+    });
+
+    stats.innerHTML = "共 <b>" + state.files.length + "</b> 个 · " +
+      '<span class="s-ok">成功 <b>' + done + "</b></span> · " +
+      '<span class="s-err">失败 <b>' + err + "</b></span> · " +
+      "待处理 <b>" + queued + "</b>";
+
+    $("btnDownloadAll").disabled = done === 0;
+    $("btnClear").disabled = state.files.length === 0;
+
+    if (!state.files.length) {
+      listArea.innerHTML = '<div class="empty">还没有文件，把文档拖进来试试</div>';
+      return;
+    }
+
+    var rows = state.files.map(function (f) {
+      var errCell = f.status === "error"
+        ? '<td class="err-text" colspan="1">' + esc(f.error) + "</td>"
+        : "";
+      return '<tr>' +
+        '<td class="f-name">' + esc(f.name) + "</td>" +
+        '<td class="f-size">' + fmtSize(f.size) + "</td>" +
+        "<td>" + statusHtml(f) + "</td>" +
+        (errCell ? "" : "<td></td>") +
+        '<td class="f-actions">' + actionsHtml(f) + "</td>" +
+        "</tr>";
+    }).join("");
+
+    listArea.innerHTML =
+      (state.ocrWarn
+        ? '<div class="ocr-warn">⚠ 队列中有超过 8MB 的 PDF（多为扫描版）：Firecrawl 匿名额度对其易失败，建议先在「MinerU API Token」框填写 Token（每行一个，额度不足自动轮询）再转换</div>'
+        : "") +
+      '<table><thead><tr><th>文件名</th><th>大小</th><th>状态</th><th>原因 / 说明</th><th style="text-align:right">操作</th></tr></thead><tbody>' +
+      rows + "</tbody></table>";
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  // ---------- 列表操作（事件委托） ----------
+  listArea.addEventListener("click", function (e) {
+    var a = e.target.closest ? e.target.closest("a[data-act]") : null;
+    if (!a) return;
+    var act = a.getAttribute("data-act");
+    var id = parseInt(a.getAttribute("data-id"), 10);
+    var item = null;
+    for (var i = 0; i < state.files.length; i++) {
+      if (state.files[i].id === id) { item = state.files[i]; break; }
+    }
+    if (!item) return;
+
+    if (act === "remove") {
+      if (item.status === "working") return;
+      state.files = state.files.filter(function (f) { return f.id !== id; });
+      render();
+    } else if (act === "download") {
+      window.location.href = "/api/download/" + item.jobId;
+    } else if (act === "preview") {
+      openModal(item);
+    }
+  });
+
+  // ---------- 工具条 ----------
+  $("btnDownloadAll").addEventListener("click", function () {
+    var ids = [];
+    state.files.forEach(function (f) {
+      if (f.status === "done" && f.jobId) ids.push(f.jobId);
+    });
+    if (!ids.length) return;
+    fetch("/api/download-zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_ids: ids })
+    }).then(function (r) {
+      if (!r.ok) throw new Error("打包失败");
+      return r.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "anydoc-markdown.zip";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 2000);
+    }).catch(function (e) { alert("打包下载失败：" + e.message); });
+  });
+
+  $("btnOpenOut").addEventListener("click", function () {
+    fetch("/api/open-output").then(function (r) { return r.json(); }).then(function (j) {
+      if (!j.ok && j.error) alert(j.error);
+    });
+  });
+
+  $("btnQuit").addEventListener("click", function () {
+    if (!confirm("确定要退出 AnyDoc 转换器吗？\n转换结果已保存在输出文件夹中。")) return;
+    fetch("/api/shutdown", { method: "POST" }).then(function () {
+      $("btnQuit").textContent = "已退出 ✓";
+      $("btnQuit").disabled = true;
+    }).catch(function () {});
+  });
+
+  $("btnClear").addEventListener("click", function () {
+    var canClear = state.files.filter(function (f) { return f.status !== "working"; });
+    state.files = [];
+    render();
+  });
+
+  // ---------- 预览弹窗 ----------
+  function openModal(item) {
+    modalJob = item;
+    $("modalTitle").textContent = item.name;
+    $("modal").classList.add("open");
+    switchTab("render");
+  }
+  function switchTab(which) {
+    if (!modalJob) return;
+    var body = $("modalBody");
+    $("tabRender").classList.toggle("on", which === "render");
+    $("tabSource").classList.toggle("on", which === "source");
+    if (!modalJob.markdown) {
+      body.innerHTML = '<div class="modal-empty">转换结果为空</div>';
+      return;
+    }
+    if (which === "source") {
+      body.innerHTML = "<pre></pre>";
+      body.firstChild.textContent = modalJob.markdown;
+    } else {
+      if (window.marked && typeof marked.parse === "function") {
+        body.innerHTML = '<div class="md-view">' + marked.parse(modalJob.markdown) + "</div>";
+      } else {
+        body.innerHTML = '<pre>' + esc(modalJob.markdown) + "</pre>";
+      }
+    }
+  }
+  $("tabRender").addEventListener("click", function () { switchTab("render"); });
+  $("tabSource").addEventListener("click", function () { switchTab("source"); });
+
+  $("btnCopy").addEventListener("click", function () {
+    if (!modalJob || !modalJob.markdown) return;
+    var text = modalJob.markdown;
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      flashCopy();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(flashCopy).catch(fallback);
+    } else fallback();
+    function flashCopy() {
+      var b = $("btnCopy");
+      var old = b.textContent;
+      b.textContent = "已复制 ✓";
+      setTimeout(function () { b.textContent = old; }, 1200);
+    }
+  });
+
+  $("btnCloseModal").addEventListener("click", function () {
+    $("modal").classList.remove("open");
+    modalJob = null;
+  });
+  $("modal").addEventListener("click", function (e) {
+    if (e.target === $("modal")) { $("modal").classList.remove("open"); modalJob = null; }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { $("modal").classList.remove("open"); modalJob = null; }
+  });
+})();
+</script>
+</body>
+</html>
