@@ -784,6 +784,77 @@ pub fn draw_close_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
 ///
 /// 24×24 网格：云轮廓 + 向上的箭头（箭杆穿过云底，和 lucide 一致）。
 /// 之前那版是「半圆 + 平底」，缩到 24px 就糊成一坨，这里改成完整云形。
+/// SVG 椭圆弧 → 折线点列
+///
+/// 设计稿里的图标是 SVG（含圆弧），GDI 没有直接画 SVG 弧的接口，
+/// 这里按 SVG 的「端点参数化 → 中心参数化」把弧拆成折线，还原设计稿的形状。
+/// 本项目用到的弧都是 rotation=0 的，所以不考虑旋转。
+fn arc_points(
+    x1: f64,
+    y1: f64,
+    rx: f64,
+    ry: f64,
+    large: bool,
+    sweep: bool,
+    x2: f64,
+    y2: f64,
+) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    if (x1 - x2).abs() < 1e-9 && (y1 - y2).abs() < 1e-9 {
+        return out;
+    }
+    let (mut rx, mut ry) = (rx.abs(), ry.abs());
+    if rx < 1e-9 || ry < 1e-9 {
+        return out;
+    }
+    let dx = (x1 - x2) / 2.0;
+    let dy = (y1 - y2) / 2.0;
+    // 半径太小就按规范放大
+    let lambda = (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry);
+    if lambda > 1.0 {
+        let s = lambda.sqrt();
+        rx *= s;
+        ry *= s;
+    }
+    let num = rx * rx * ry * ry - rx * rx * dy * dy - ry * ry * dx * dx;
+    let den = rx * rx * dy * dy + ry * ry * dx * dx;
+    let mut coef = if den <= 1e-12 { 0.0 } else { (num / den).max(0.0).sqrt() };
+    if large == sweep {
+        coef = -coef;
+    }
+    let cxp = coef * rx * dy / ry;
+    let cyp = -coef * ry * dx / rx;
+    let cx = cxp + (x1 + x2) / 2.0;
+    let cy = cyp + (y1 + y2) / 2.0;
+    let ux = (dx - cxp) / rx;
+    let uy = (dy - cyp) / ry;
+    let vx = (-dx - cxp) / rx;
+    let vy = (-dy - cyp) / ry;
+    // 注意：Rust 的 f64::atan2(self, other) 是 atan2(y=self, x=other)，
+    // 所以这里要写 uy.atan2(ux)，别写成 ux.atan2(uy)（那样弧会整个画歪）
+    let theta1 = uy.atan2(ux);
+    let mut dtheta = vy.atan2(vx) - theta1;
+    const TAU: f64 = std::f64::consts::PI * 2.0;
+    if !sweep && dtheta > 0.0 {
+        dtheta -= TAU;
+    }
+    if sweep && dtheta < 0.0 {
+        dtheta += TAU;
+    }
+    let steps = 24;
+    for i in 0..=steps {
+        let t = theta1 + dtheta * (i as f64) / (steps as f64);
+        out.push((cx + rx * t.cos(), cy + ry * t.sin()));
+    }
+    out
+}
+
+/// 云朵上传图标（tabler / 设计稿 cloud-upload）
+///
+/// 设计稿路径：
+///   M7 16 a4 4 0 0 1 -.88 -7.903 A5 5 0 1 1 15.9 6 L16 6 a5 5 0 0 1 1 9.9
+///   M15 13 l-3 -3 m0 0 l-3 3 m3 -3 v12
+/// 云是三段圆弧拼的（底部开口），上传箭头从云底穿出。
 pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF) {
     unsafe {
         let f = size as f64 / 24.0;
@@ -796,43 +867,35 @@ pub fn draw_cloud_upload_icon(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLO
             }
         };
 
-        // 云轮廓（底部平线，右侧回到起点）
-        let cloud: [(f64, f64); 10] = [
-            (4.6, 18.0),  // 左下
-            (3.2, 14.6),
-            (4.6, 11.2),
-            (7.6, 8.9),
-            (10.6, 8.0),
-            (13.4, 6.1),  // 顶部
-            (16.4, 8.0),
-            (19.4, 10.6),
-            (20.8, 14.0),
-            (19.6, 18.0), // 右下
-        ];
-        for (i, q) in cloud.iter().enumerate() {
-            let pt = p(q.0, q.1);
+        // ── 云轮廓：左小弧 → 顶大弧 → 一小段直线 → 右弧 ──
+        let mut cloud: Vec<(f64, f64)> = Vec::new();
+        // M7 16 a4 4 0 0 1 -.88 -7.903  →  (6.12, 8.097)
+        cloud.extend(arc_points(7.0, 16.0, 4.0, 4.0, false, true, 6.12, 8.097));
+        // A5 5 0 1 1 15.9 6
+        cloud.extend(arc_points(6.12, 8.097, 5.0, 5.0, true, true, 15.9, 6.0));
+        // L16 6
+        cloud.push((16.0, 6.0));
+        // a5 5 0 0 1 1 9.9 → (17, 15.9)
+        cloud.extend(arc_points(16.0, 6.0, 5.0, 5.0, false, true, 17.0, 15.9));
+
+        for (i, (x, y)) in cloud.iter().enumerate() {
+            let pt = p(*x, *y);
             if i == 0 {
                 MoveToEx(hdc, pt.x, pt.y, None);
             } else {
                 LineTo(hdc, pt.x, pt.y);
             }
         }
-        // 底边
-        let last = p(cloud[cloud.len() - 1].0, cloud[cloud.len() - 1].1);
-        let first = p(cloud[0].0, cloud[0].1);
-        LineTo(hdc, first.x, first.y);
 
-        // 箭头：头部 V 形 + 竖杆（竖杆穿过云底）
-        let a1 = p(8.6, 12.4);
-        let a2 = p(12.0, 9.0);
-        let a3 = p(15.4, 12.4);
-        MoveToEx(hdc, a1.x, a1.y, None);
-        LineTo(hdc, a2.x, a2.y);
-        LineTo(hdc, a3.x, a3.y);
-        let s1 = p(12.0, 10.4);
-        let s2 = p(12.0, 20.6);
-        MoveToEx(hdc, s1.x, s1.y, None);
-        LineTo(hdc, s2.x, s2.y);
+        // ── 上传箭头：M15 13 l-3 -3 m0 0 l-3 3 m3 -3 v12 ──
+        let head = [p(15.0, 13.0), p(12.0, 10.0), p(9.0, 13.0)];
+        MoveToEx(hdc, head[0].x, head[0].y, None);
+        LineTo(hdc, head[1].x, head[1].y);
+        LineTo(hdc, head[2].x, head[2].y);
+        let shaft_top = p(12.0, 10.0);
+        let shaft_bot = p(12.0, 22.0);
+        MoveToEx(hdc, shaft_top.x, shaft_top.y, None);
+        LineTo(hdc, shaft_bot.x, shaft_bot.y);
 
         let _ = SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(pen.0));
